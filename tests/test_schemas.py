@@ -60,3 +60,24 @@ def test_max_drawdown_stop_requires_valid_threshold() -> None:
     payload["strategy"]["risk_control"] = {"max_drawdown_stop": {"enabled": True, "threshold": 1.0}}
     with pytest.raises(ValidationError):
         RunSpec.model_validate(payload)
+
+
+def test_factor_research_requires_explicit_research_contract() -> None:
+    payload = base_payload()
+    payload.pop("strategy")
+    payload["evaluation"] = {"mode": "factor_research"}
+    with pytest.raises(ValidationError, match="evaluation.research"):
+        RunSpec.model_validate(payload)
+
+    payload["evaluation"] = {
+        "mode": "factor_research",
+        "research": {
+            "formation": {"kind": "calendar", "interval": "1w", "weekday": 6, "time_utc": "23:45"},
+            "returns": {"horizon": "1w", "start_price": "close", "end_price": "close"},
+            "direction": "higher_predicts_lower_return",
+            "portfolio": {"selection": "quantiles", "quantiles": 3},
+        },
+    }
+    spec = RunSpec.model_validate(payload)
+    assert spec.strategy is None
+    assert spec.evaluation is not None

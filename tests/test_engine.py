@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from quantbacktest.analytics import performance_metrics
 from quantbacktest.engine import _forward_returns, _simulate_portfolio, run_backtest
 from quantbacktest.schemas import RunSpec
 
@@ -44,6 +45,67 @@ def test_trace_backtest_writes_artifacts(tmp_path: Path) -> None:
     assert (result.run_dir / "debug_trace.json").exists()
     assert (result.run_dir / "risk_events.csv").exists()
     assert "risk_control" in (result.run_dir / "debug_trace.json").read_text(encoding="utf-8")
+
+
+def test_factor_research_writes_statistical_artifacts_without_account_metrics(tmp_path: Path) -> None:
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+    symbols = list("ABCDEFGHIJ")
+    for shift, symbol in enumerate(symbols):
+        dates = pd.date_range("2024-01-01", periods=24, freq="h")
+        values = [100 + shift + value * (shift + 1) / 10 for value in range(24)]
+        pd.DataFrame(
+            {
+                "timestamp": dates,
+                "open": values,
+                "high": values,
+                "low": values,
+                "close": values,
+                "volume_from": 1,
+                "volume_to": 1,
+            }
+        ).to_csv(data_path / f"{symbol}_1h.csv", index=False)
+    factor = tmp_path / "factor.py"
+    factor.write_text(
+        "FactorMeta={'required_fields':['close'], 'min_lookback_bars':1, "
+        "'supported_modes':['cross_sectional']}\n"
+        "def compute_factor(context):\n"
+        " data=context.data.copy(); data['factor']=data.groupby('symbol').close.pct_change(); "
+        "return data[['timestamp','symbol','factor']]\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "name": "research_case",
+        "data": {
+            "adapter": "crypto_top50",
+            "path": str(data_path),
+            "market": "spot",
+            "frequency": "1h",
+            "symbols": symbols,
+        },
+        "factor": {"module_path": str(factor)},
+        "evaluation": {
+            "mode": "factor_research",
+            "research": {
+                "formation": {"kind": "calendar", "interval": "1h", "time_utc": "00:00"},
+                "returns": {"horizon": "1h", "start_price": "close", "end_price": "close"},
+                "direction": "higher_predicts_higher_return",
+                "portfolio": {"selection": "quantiles", "quantiles": 2},
+                "ic_decay_horizons": ["1h", "4h"],
+            },
+        },
+        "debug": {"mode": "trace"},
+        "ml": {"enabled": True, "model": "lightgbm", "parameters": {"n_estimators": 5}},
+        "output": {"root": str(tmp_path / "results")},
+    }
+    result = run_backtest(RunSpec.model_validate(payload), tmp_path)
+    assert result.metrics["evaluation_mode"] == "factor_research"
+    assert "annual_return" not in result.metrics
+    assert (result.run_dir / "report.html").exists()
+    assert (result.run_dir / "research_ic_decay.csv").exists()
+    assert (result.run_dir / "research_contributions.csv").exists()
+    assert (result.run_dir / "model.pkl").exists()
+    assert not (result.run_dir / "returns.csv").exists()
 
 
 def test_drawdown_stop_liquidates_next_open_and_reenters_next_rebalance() -> None:
@@ -140,3 +202,14 @@ def test_zero_signal_closes_existing_single_asset_position_at_next_open() -> Non
     exits = result.trades[result.trades["target_weight"] == 0.0]
     assert len(exits) == 1
     assert exits.iloc[0]["timestamp"] == timestamps[2]
+
+
+def test_strategy_metrics_disable_annualization_after_non_positive_equity() -> None:
+    returns = pd.Series(
+        [0.1, -1.2], index=pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC")
+    )
+    metrics = performance_metrics(returns, "1h")
+    assert metrics["account_equity_non_positive"] is True
+    assert metrics["annual_return"] is None
+    assert metrics["calmar"] is None
+    assert metrics["first_account_failure_time"] == "2024-01-01T01:00:00+00:00"

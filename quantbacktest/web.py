@@ -23,6 +23,16 @@ def _show_result(result: RunResult) -> None:
         path = result.run_dir / file_name
         if path.exists():
             st.download_button(title, path.read_bytes(), file_name=file_name, mime="text/csv")
+    for file_name, title in (
+        ("research_group_returns.csv", "因子研究分组收益"),
+        ("research_spread.csv", "因子研究 Top-Bottom 差值"),
+        ("research_ic_decay.csv", "因子研究 IC 衰减"),
+        ("research_contributions.csv", "因子研究单币贡献"),
+        ("research_leave_one_out.csv", "因子研究逐币剔除"),
+    ):
+        path = result.run_dir / file_name
+        if path.exists():
+            st.download_button(title, path.read_bytes(), file_name=file_name, mime="text/csv")
     trace = result.run_dir / "debug_trace.json"
     if trace.exists():
         st.subheader("调试轨迹")
@@ -43,12 +53,44 @@ def _load_yaml(uploaded: Any) -> dict[str, Any]:
     return payload
 
 
+def _show_factor_research_contract() -> None:
+    with st.expander("论文因子研究配置说明（新研究默认使用）", expanded=False):
+        st.markdown(
+            "`evaluation.mode: factor_research` 用于检验因子对未来横截面收益的预测力，"
+            "不会生成账户净值、CAGR 或爆仓结论。每篇论文都必须明确形成时间表、收益口径、"
+            "因子方向和分组规则。所有时间均为 UTC。"
+        )
+        st.code(
+            """evaluation:
+  mode: factor_research
+  research:
+    formation:
+      kind: calendar        # calendar 或 bar_interval
+      interval: 1w          # 1h / 4h / 1d / 1w
+      weekday: 6            # 周频必填；0=周一，6=周日
+      time_utc: \"00:00\"    # 必填，不存在锚点将跳过而非漂移
+    returns:
+      horizon: 1w
+      start_price: close    # close 或 next_open
+      end_price: close      # close 或 open
+    direction: higher_predicts_higher_return
+    portfolio:
+      selection: quantiles
+      quantiles: 3
+      weighting: equal      # equal / score / market_cap
+    ic_decay_horizons: [1d, 1w]
+""",
+            language="yaml",
+        )
+
+
 st.set_page_config(page_title="QuantBacktest", layout="wide")
 st.title("QuantBacktest 加密货币因子研究台")
 st.caption("信号在收盘生成、默认于下一根开盘成交；回测结果保存在调用项目的 results/backtests。")
 
 st.header("外部项目导入回测")
 st.info("仅上传你自己编写或已审核的可信 Python 因子脚本；该脚本会在本机执行。")
+_show_factor_research_contract()
 source_root = st.text_input("源项目绝对目录", placeholder=r"E:\py\my_factor_project")
 factor_upload = st.file_uploader("因子脚本（.py）", type=["py"], key="import_factor")
 config_upload = st.file_uploader("回测配置（.yaml / .yml）", type=["yaml", "yml"], key="import_config")

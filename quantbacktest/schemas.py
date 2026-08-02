@@ -29,10 +29,16 @@ class DebugMode(str, Enum):
     replay = "replay"
 
 
+class EvaluationMode(str, Enum):
+    factor_research = "factor_research"
+    strategy_simulation = "strategy_simulation"
+
+
 class UniverseSpec(StrictModel):
     min_assets: int = Field(default=10, ge=2)
     min_history_bars: int = Field(default=0, ge=0)
     liquidity_rule: dict[str, Any] | None = None
+    membership_path: Path | None = None
 
 
 class DataSpec(StrictModel):
@@ -110,6 +116,69 @@ class StrategySpec(StrictModel):
         return self
 
 
+class FormationScheduleSpec(StrictModel):
+    kind: Literal["calendar", "bar_interval"]
+    interval: Literal["1h", "4h", "1d", "1w"] | None = None
+    weekday: int | None = Field(default=None, ge=0, le=6)
+    time_utc: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    every_n_bars: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> FormationScheduleSpec:
+        if self.kind == "calendar":
+            if self.interval is None or self.time_utc is None:
+                raise ValueError("日历形成时间表必须提供 interval 和 time_utc")
+            if self.interval == "1w" and self.weekday is None:
+                raise ValueError("周频日历形成时间表必须提供 weekday（0=周一，6=周日）")
+            if self.every_n_bars is not None:
+                raise ValueError("calendar 时间表不能提供 every_n_bars")
+        elif self.every_n_bars is None:
+            raise ValueError("bar_interval 时间表必须提供 every_n_bars")
+        return self
+
+
+class ResearchReturnSpec(StrictModel):
+    horizon: Literal["1h", "4h", "1d", "1w"]
+    start_price: Literal["close", "next_open"]
+    end_price: Literal["close", "open"]
+
+
+class ResearchPortfolioSpec(StrictModel):
+    selection: Literal["quantiles", "top_k"]
+    quantiles: int | None = Field(default=None, ge=2)
+    top_k: int | None = Field(default=None, ge=1)
+    weighting: Literal["equal", "score", "market_cap"] = "equal"
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> ResearchPortfolioSpec:
+        if self.selection == "quantiles" and self.quantiles is None:
+            raise ValueError("研究分组 selection=quantiles 时必须提供 quantiles")
+        if self.selection == "top_k" and self.top_k is None:
+            raise ValueError("研究分组 selection=top_k 时必须提供 top_k")
+        return self
+
+
+class FactorResearchSpec(StrictModel):
+    formation: FormationScheduleSpec
+    returns: ResearchReturnSpec
+    direction: Literal["higher_predicts_higher_return", "higher_predicts_lower_return"]
+    portfolio: ResearchPortfolioSpec
+    ic_decay_horizons: list[Literal["1h", "4h", "1d", "1w"]] = Field(default_factory=list)
+
+
+class EvaluationSpec(StrictModel):
+    mode: EvaluationMode
+    research: FactorResearchSpec | None = None
+
+    @model_validator(mode="after")
+    def validate_research(self) -> EvaluationSpec:
+        if self.mode is EvaluationMode.factor_research and self.research is None:
+            raise ValueError("factor_research 模式必须提供 evaluation.research")
+        if self.mode is EvaluationMode.strategy_simulation and self.research is not None:
+            raise ValueError("strategy_simulation 模式不能提供 evaluation.research")
+        return self
+
+
 class CostSpec(StrictModel):
     fee_bps: float = Field(default=0.0, ge=0)
     slippage_bps: float = Field(default=0.0, ge=0)
@@ -156,7 +225,8 @@ class RunSpec(StrictModel):
     name: str = Field(min_length=1)
     data: DataSpec
     factor: FactorSpec
-    strategy: StrategySpec
+    strategy: StrategySpec | None = None
+    evaluation: EvaluationSpec | None = None
     costs: CostSpec = Field(default_factory=CostSpec)
     benchmark: BenchmarkSpec = Field(default_factory=BenchmarkSpec)
     ml: MLSpec = Field(default_factory=MLSpec)
@@ -166,6 +236,12 @@ class RunSpec(StrictModel):
 
     @model_validator(mode="after")
     def validate_cross_section(self) -> RunSpec:
+        is_research = self.evaluation is not None and self.evaluation.mode is EvaluationMode.factor_research
+        if not is_research and self.strategy is None:
+            raise ValueError("strategy_simulation 或旧配置必须提供 strategy")
+        if is_research:
+            return self
+        assert self.strategy is not None
         if self.strategy.mode is StrategyMode.cross_sectional:
             universe = self.data.universe or UniverseSpec()
             if len(self.data.symbols) < universe.min_assets:

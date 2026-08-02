@@ -72,8 +72,49 @@ def render_report(
         risk_html = f"<h2>回撤止损事件</h2>{risk_events.to_html(index=False, border=0)}"
     path.write_text(
         "<html><meta charset='utf-8'><body>"
-        f"<h1>{provenance.get('name')}</h1><h2>指标</h2><ul>{metric_html}</ul>"
+        f"<h1>{provenance.get('name')}</h1><h2>策略指标</h2><ul>{metric_html}</ul>"
         f"<h2>数据与复现警告</h2><ul>{warning_html}</ul>{risk_html}"
+        f"{figure.to_html(full_html=False, include_plotlyjs=True)}"
+        "</body></html>",
+        encoding="utf-8",
+    )
+
+
+def render_research_report(
+    path: Path,
+    group_returns: pd.DataFrame,
+    spread: pd.DataFrame,
+    metrics: dict[str, Any],
+    provenance: dict[str, Any],
+) -> None:
+    """Render paper-style factor evidence without presenting the spread as account equity."""
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        subplot_titles=("分组未来收益", "累计统计型 Top−Bottom 差值（非账户净值）"),
+    )
+    for bucket_name, group in group_returns.groupby("bucket_name", sort=True):
+        figure.add_trace(
+            go.Scatter(x=group["formation_time"], y=group["return_value"], name=str(bucket_name)),
+            row=1,
+            col=1,
+        )
+    cumulative = spread.set_index("formation_time")["spread_return"].cumsum()
+    figure.add_trace(
+        go.Scatter(x=cumulative.index, y=cumulative, name="累计统计差值", fill="tozeroy"), row=2, col=1
+    )
+    figure.update_layout(title=provenance.get("name", "因子研究报告"), template="plotly_white", height=760)
+    metric_html = "".join(
+        f"<li><b>{key}</b>: {value}</li>"
+        for key, value in metrics.items()
+        if not isinstance(value, (dict, list))
+    )
+    warning_html = "".join(f"<li>{item}</li>" for item in provenance.get("warnings", []))
+    path.write_text(
+        "<html><meta charset='utf-8'><body>"
+        f"<h1>{provenance.get('name')}</h1><h2>因子研究证据</h2><ul>{metric_html}</ul>"
+        f"<h2>数据与复现限制</h2><ul>{warning_html}</ul>"
         f"{figure.to_html(full_html=False, include_plotlyjs=True)}"
         "</body></html>",
         encoding="utf-8",

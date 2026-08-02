@@ -15,10 +15,16 @@ from quantbacktest.analytics import (
     performance_metrics,
     quantile_returns,
 )
-from quantbacktest.artifacts import create_run_dir, render_report, write_json
+from quantbacktest.artifacts import (
+    create_run_dir,
+    render_report,
+    render_research_report,
+    write_json,
+)
 from quantbacktest.factors import FactorContext, execute_factor
 from quantbacktest.ml import train_oos_model
-from quantbacktest.schemas import DebugMode, RunSpec, StrategyMode
+from quantbacktest.research import evaluate_factor_research
+from quantbacktest.schemas import DebugMode, EvaluationMode, RunSpec, StrategyMode
 
 
 @dataclass
@@ -35,6 +41,8 @@ class SimulationResult:
     trades: pd.DataFrame
     risk_events: pd.DataFrame
     cash_bar_ratio: float
+    termination_reason: str | None = None
+    termination_time: pd.Timestamp | None = None
 
 
 def _forward_returns(frame: pd.DataFrame, holding_bars: int) -> pd.DataFrame:
@@ -122,6 +130,8 @@ def _simulate_portfolio(frame: pd.DataFrame, positions: pd.DataFrame, spec: RunS
     risk_records: list[dict[str, Any]] = []
     in_stop_cooldown = False
     stop_cash_bars = 0
+    termination_reason: str | None = None
+    termination_time: pd.Timestamp | None = None
 
     def _weighted_return(weights: dict[str, float], start: pd.Series, end: pd.Series) -> float:
         result = 0.0
@@ -202,9 +212,11 @@ def _simulate_portfolio(frame: pd.DataFrame, positions: pd.DataFrame, spec: RunS
             equity *= 1.0 + _weighted_return(current_weights, opens, closes)
         elif in_stop_cooldown:
             stop_cash_bars += 1
-        if equity <= 0:
-            raise ValueError("组合净值降至零或以下，无法继续计算回撤止损")
         returns[timestamp] = equity / equity_before_bar - 1.0
+        if equity <= 0:
+            termination_reason = "组合净值降至零或以下；停止合成收益模拟，后续账户年化指标无经济解释"
+            termination_time = timestamp
+            break
         peak_equity = max(peak_equity, equity)
         drawdown = equity / peak_equity - 1.0
 
@@ -279,6 +291,8 @@ def _simulate_portfolio(frame: pd.DataFrame, positions: pd.DataFrame, spec: RunS
         trades=trades,
         risk_events=risk_events,
         cash_bar_ratio=stop_cash_bars / len(timestamps),
+        termination_reason=termination_reason,
+        termination_time=termination_time,
     )
 
 
@@ -323,6 +337,8 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
     data_spec = spec.data.model_copy(deep=True)
     if not data_spec.path.is_absolute():
         data_spec.path = (project_root / data_spec.path).resolve()
+    if data_spec.universe and data_spec.universe.membership_path and not data_spec.universe.membership_path.is_absolute():
+        data_spec.universe.membership_path = (project_root / data_spec.universe.membership_path).resolve()
     factor_path = spec.factor.module_path
     if not factor_path.is_absolute():
         factor_path = (project_root / factor_path).resolve()
@@ -343,10 +359,11 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
         raise ValueError("调试时间窗口或币种过滤后没有可用数据")
     factor, factor_meta = execute_factor(factor_path, spec.factor.callable, FactorContext(data, spec.factor.parameters))
     supported_modes = factor_meta["meta"]["supported_modes"]
-    if spec.strategy.mode.value not in supported_modes:
-        raise ValueError(f"因子不支持策略模式 {spec.strategy.mode.value}；支持：{supported_modes}")
+    is_research = spec.evaluation is not None and spec.evaluation.mode is EvaluationMode.factor_research
+    required_mode = "cross_sectional" if is_research else spec.strategy.mode.value if spec.strategy else ""
+    if required_mode not in supported_modes:
+        raise ValueError(f"因子不支持模式 {required_mode}；支持：{supported_modes}")
     frame = data.merge(factor, on=["timestamp", "symbol"], how="left", validate="one_to_one")
-    frame = _forward_returns(frame, spec.strategy.execution.holding_bars)
     warnings = ["流动性筛选未验证"]
     if spec.data.adapter == "crypto_top50":
         warnings.append("静态 Top50 可能存在幸存者偏差；未验证历史上市与下市信息")
@@ -357,11 +374,69 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
 
     run_dir = create_run_dir(output_root, spec.name)
     shutil.copy2(factor_path, run_dir / "factor_snapshot.py")
-    frame, ml_meta = train_oos_model(frame, spec.ml, run_dir / "model.pkl")
     base_meta = {"name": spec.name, "warnings": warnings, "data": data_meta, "factor": factor_meta}
+    write_json(run_dir / "run_spec.json", spec.model_dump(mode="json"))
+
+    if is_research:
+        assert spec.evaluation is not None and spec.evaluation.research is not None
+        research = evaluate_factor_research(frame, spec.evaluation.research, data_spec.universe)
+        ml_meta: dict[str, Any] = {"enabled": False}
+        if spec.ml.enabled:
+            ml_input = research.panel.rename(columns={"formation_time": "timestamp"})
+            scored, ml_meta = train_oos_model(
+                ml_input,
+                spec.ml,
+                run_dir / "model.pkl",
+                label_end_column="return_end_time",
+            )
+            predictions = scored[["timestamp", "symbol", "factor"]]
+            scored_frame = frame.drop(columns="factor").merge(
+                predictions, on=["timestamp", "symbol"], how="left", validate="one_to_one"
+            )
+            research = evaluate_factor_research(scored_frame, spec.evaluation.research, data_spec.universe)
+        warnings.extend(
+            [
+                "因子研究报告衡量统计型未来收益，不是账户净值或可执行策略。",
+                "未提供时间点资产池清单时，报告按 data.symbols 的静态资产池计算。",
+            ]
+        )
+        base_meta["evaluation"] = spec.evaluation.model_dump(mode="json")
+        base_meta["ml"] = ml_meta
+        write_json(run_dir / "metadata.json", base_meta)
+        metrics = {**research.metrics, "warnings": warnings}
+        research.panel.to_csv(run_dir / "research_panel.csv", index=False)
+        research.group_returns.to_csv(run_dir / "research_group_returns.csv", index=False)
+        research.spread.to_csv(run_dir / "research_spread.csv", index=False)
+        research.contributions.to_csv(run_dir / "research_contributions.csv", index=False)
+        research.leave_one_out.to_csv(run_dir / "research_leave_one_out.csv", index=False)
+        research.ic_decay.to_csv(run_dir / "research_ic_decay.csv", index=False)
+        research.periods.to_csv(run_dir / "research_periods.csv", index=False)
+        research.skipped_periods.to_csv(run_dir / "research_skipped_periods.csv", index=False)
+        if spec.debug.mode in {DebugMode.trace, DebugMode.replay}:
+            write_json(
+                run_dir / "debug_trace.json",
+                {
+                    "data": {"rows": len(data), "symbols": int(data["symbol"].nunique())},
+                    "research": {
+                        "formation_periods": research.metrics["formation_periods"],
+                        "skipped_periods": research.skipped_periods.to_dict("records"),
+                        "sample": research.panel.head(20).to_dict("records"),
+                    },
+                },
+            )
+        write_json(run_dir / "metrics.json", metrics)
+        render_research_report(run_dir / "report.html", research.group_returns, research.spread, metrics, base_meta)
+        return RunResult(run_dir, metrics, warnings)
+
+    assert spec.strategy is not None
+    frame = _forward_returns(frame, spec.strategy.execution.holding_bars)
+    frame, ml_meta = train_oos_model(frame, spec.ml, run_dir / "model.pkl")
+    if spec.evaluation is None:
+        warnings.append("legacy strategy simulation：该结果不是默认的因子研究结论")
+    if spec.strategy.long_short == "market_neutral" and spec.data.market.value == "spot":
+        warnings.append("现货价格构造的空头为合成收益模拟，未建模借币、保证金或强平，非可执行账户")
     base_meta["ml"] = ml_meta
     base_meta["risk_control"] = spec.strategy.risk_control.model_dump(mode="json")
-    write_json(run_dir / "run_spec.json", spec.model_dump(mode="json"))
     write_json(run_dir / "metadata.json", base_meta)
     if spec.debug.mode is DebugMode.dry_run:
         write_json(run_dir / "debug_trace.json", _trace(frame, None))
@@ -385,6 +460,12 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
     metrics["risk_stop_trigger_count"] = len(simulation.risk_events)
     metrics["risk_stop_cost"] = float(simulation.risk_events["liquidation_cost"].fillna(0).sum())
     metrics["stop_cash_bar_ratio"] = simulation.cash_bar_ratio
+    metrics["simulation_termination_reason"] = simulation.termination_reason
+    metrics["simulation_termination_time"] = (
+        simulation.termination_time.isoformat() if simulation.termination_time is not None else None
+    )
+    if simulation.termination_reason:
+        warnings.append(simulation.termination_reason)
     metrics["warnings"] = warnings
     returns.to_csv(run_dir / "returns.csv", header=True)
     positions.to_csv(run_dir / "positions.csv", index=False)
