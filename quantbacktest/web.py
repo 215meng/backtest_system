@@ -6,7 +6,6 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import streamlit as st
 import yaml
 
@@ -91,138 +90,86 @@ def _show_report_actions(report_path: Path, key: str) -> None:
         )
 
 
-def _load_json_file(path: Path) -> dict[str, Any] | list[Any] | None:
-    """读取因子库工件中的 JSON；单个损坏文件不应阻塞详情页。"""
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return value
+def _load_factor_metrics(record: dict[str, Any], library_root: Path) -> dict[str, Any]:
+    """读取因子库快照中的指标；兼容旧记录和仅有候选元数据的因子。"""
+    artifact_dir = library_root / "artifacts" / str(record["factor_id"])
+    for metrics_path in (artifact_dir / "metrics.json", artifact_dir / "candidate_metrics.json"):
+        if not metrics_path.is_file():
+            continue
+        try:
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
 
-
-def _factor_metrics(artifact_dir: Path) -> tuple[dict[str, Any] | None, Path | None]:
-    for file_name in ("metrics.json", "candidate_metrics.json"):
-        path = artifact_dir / file_name
-        value = _load_json_file(path)
-        if isinstance(value, dict):
-            return value, path
-    return None, None
-
-
-def _render_factor_detail(record: dict[str, Any], library_root: Path) -> None:
-    """展示因子快照、回测指标、配置和可下载的逐项回测明细。"""
-    factor_id = str(record["factor_id"])
-    artifact_dir = library_root / "artifacts" / factor_id
-    st.subheader(f"因子明细：{record.get('name', factor_id)}")
-    if not artifact_dir.is_dir():
-        st.error(f"找不到因子工件目录：{artifact_dir}")
-        return
-
-    st.caption(f"因子 ID：{factor_id} · 状态：{record.get('status', 'unknown')} · 工件：{artifact_dir}")
-    metrics, metrics_path = _factor_metrics(artifact_dir)
-    if metrics is None:
-        st.info("该候选尚未关联成功回测，因此暂时没有可复现的回测指标。")
-    else:
-        metric_labels = (
-            ("total_return", "总收益"),
-            ("annual_return", "年化收益"),
-            ("sharpe", "Sharpe"),
-            ("max_drawdown", "最大回撤"),
-            ("ic_mean", "平均 IC"),
-            ("icir", "ICIR"),
-            ("coverage", "覆盖率"),
-            ("total_turnover", "总换手"),
-        )
-        available = [(key, label) for key, label in metric_labels if key in metrics]
-        for offset in range(0, len(available), 4):
-            row = available[offset : offset + 4]
-            columns = st.columns(len(row))
-            for column, (key, label) in zip(columns, row):
-                value = metrics[key]
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    column.metric(label, f"{value:.6g}")
-                else:
-                    column.metric(label, str(value))
-        st.caption(f"指标来源：{metrics_path.name}")
-        with st.expander("完整回测指标 JSON", expanded=False):
-            st.json(metrics)
-
-    report_path = artifact_dir / "report.html"
-    if not report_path.is_file():
-        report_path = artifact_dir / "backtest_results" / "report.html"
-    source_run_dirs = []
+    # 旧版批准工件可能未复制逐项结果，允许列表从已登记的运行目录补读汇总指标。
     for source_key in ("evidence_run", "source_run"):
         source_value = record.get(source_key)
-        if source_value:
-            source_path = Path(str(source_value))
-            if source_path.is_dir() and source_path not in source_run_dirs:
-                source_run_dirs.append(source_path)
-    if not report_path.is_file():
-        for source_path in source_run_dirs:
-            candidate_report = source_path / "report.html"
-            if candidate_report.is_file():
-                report_path = candidate_report
-                st.caption("该旧版因子工件的 HTML 报告来自登记的来源运行目录。")
-                break
-    if report_path.is_file():
-        _show_report_actions(report_path, key=f"factor_detail_{factor_id}")
-    else:
-        st.warning("该因子工件没有 HTML 回测报告。")
+        if not source_value:
+            continue
+        metrics_path = Path(str(source_value)) / "metrics.json"
+        if not metrics_path.is_file():
+            continue
+        try:
+            payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
 
-    config_paths = [
-        artifact_dir / "run_spec.json",
-        artifact_dir / "evidence_run_spec.json",
-        artifact_dir / "candidate_metadata.json",
-        artifact_dir / "approval_metadata.json",
-    ]
-    configs = [(path.name, value) for path in config_paths if (value := _load_json_file(path)) is not None]
-    if configs:
-        with st.expander("配置、来源与审核信息", expanded=False):
-            for name, value in configs:
-                st.markdown(f"**{name}**")
-                st.json(value)
 
-    results_dir = artifact_dir / "backtest_results"
-    if not results_dir.is_dir():
-        results_dir = artifact_dir
-    if not any(path.is_file() and path.suffix.lower() == ".csv" for path in results_dir.iterdir()):
-        for source_path in source_run_dirs:
-            if any(path.is_file() and path.suffix.lower() == ".csv" for path in source_path.iterdir()):
-                results_dir = source_path
-                st.caption("该旧版因子工件未保存逐项 CSV，当前明细来自登记的来源运行目录。")
-                break
-    table_paths = sorted(
-        path for path in results_dir.iterdir() if path.is_file() and path.suffix.lower() == ".csv"
-    )
-    if not table_paths:
-        st.info("该因子没有可展示的 CSV 回测明细；旧版本工件可能只保存了汇总指标和报告。")
-        return
-
-    st.markdown("**回测明细数据**")
-    table_by_name = {path.name: path for path in table_paths}
-    selected_table = st.selectbox(
-        "选择明细表",
-        list(table_by_name),
-        format_func=lambda name: f"{name}（{table_by_name[name].stat().st_size:,} 字节）",
-        key=f"factor_table_{factor_id}",
-    )
-    selected_path = table_by_name[selected_table]
-    try:
-        frame = pd.read_csv(selected_path)
-        st.caption(f"{selected_table}：共 {len(frame):,} 行，页面预览前 2,000 行。")
-        st.dataframe(frame.head(2000))
-        st.download_button(
-            "下载完整明细 CSV",
-            selected_path.read_bytes(),
-            file_name=selected_path.name,
-            mime="text/csv",
-            key=f"factor_csv_{factor_id}_{selected_table}",
-            icon=":material/download:",
-        )
-    except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        st.error(f"读取明细表失败：{exc}")
+def _factor_table_rows(records: list[dict[str, Any]], library_root: Path) -> list[dict[str, Any]]:
+    """将因子元数据与回测指标合并为表格行，避免详情数据脱离因子记录。"""
+    labels = {
+        "observations": "观测数",
+        "total_return": "总收益",
+        "annual_return": "年化收益",
+        "annual_volatility": "年化波动",
+        "sharpe": "Sharpe",
+        "max_drawdown": "最大回撤",
+        "calmar": "Calmar",
+        "coverage": "覆盖率",
+        "factor_mean": "因子均值",
+        "factor_std": "因子标准差",
+        "ic_mean": "平均 IC",
+        "ic_std": "IC 标准差",
+        "icir": "ICIR",
+        "ic_observations": "IC 观测数",
+        "total_turnover": "总换手",
+        "total_cost": "总成本",
+        "risk_stop_trigger_count": "止损触发次数",
+        "risk_stop_cost": "止损成本",
+        "stop_cash_bar_ratio": "止损现金占比",
+        "beta": "市场 Beta",
+        "alpha": "市场调整 Alpha",
+    }
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        row = {
+            "因子 ID": record.get("factor_id"),
+            "名称": record.get("name"),
+            "状态": record.get("status"),
+            "创建时间": record.get("created_at"),
+            "批准时间": record.get("approved_at"),
+            "来源类型": record.get("source_type"),
+            "来源运行": record.get("source_run"),
+            "证据运行": record.get("evidence_run"),
+            "脚本 SHA-256": record.get("script_hash"),
+            "配置 SHA-256": record.get("config_hash"),
+        }
+        metrics = _load_factor_metrics(record, library_root)
+        for key, value in metrics.items():
+            if key == "warnings":
+                row["回测·警告"] = "；".join(str(item) for item in value) if isinstance(value, list) else str(value)
+                continue
+            display_name = labels.get(key, key)
+            row[f"回测·{display_name}"] = value
+        if not metrics:
+            row["回测·证据状态"] = "尚未关联成功回测"
+        rows.append(row)
+    return rows
 
 
 def _show_factor_research_contract() -> None:
@@ -335,7 +282,7 @@ def _render_factor_library() -> None:
         if not candidates:
             st.info("暂无候选因子。候选尚未获得可复现回测证据。")
         else:
-            st.dataframe(candidates)
+            st.dataframe(_factor_table_rows(candidates, library_root))
             candidate_by_id = {item["factor_id"]: item for item in candidates}
             with st.form("approve_candidate"):
                 factor_id = st.selectbox(
@@ -373,7 +320,7 @@ def _render_factor_library() -> None:
         if not approved:
             st.info("暂无已批准因子。")
         else:
-            st.dataframe(approved)
+            st.dataframe(_factor_table_rows(approved, library_root))
             approved_by_id = {item["factor_id"]: item for item in approved}
             report_factor_id = st.selectbox(
                 "查看批准因子的报告",
@@ -392,23 +339,6 @@ def _render_factor_library() -> None:
                             if path.is_file()
                         ]
                     )
-
-
-    all_factors = candidates + approved
-    if all_factors:
-        with st.container(border=True):
-            st.subheader("因子明细与回测数据")
-            factor_by_id = {item["factor_id"]: item for item in all_factors}
-            detail_factor_id = st.selectbox(
-                "选择因子查看完整明细",
-                list(factor_by_id),
-                format_func=lambda value: (
-                    f"{factor_by_id[value]['name']} · "
-                    f"{factor_by_id[value].get('status', 'unknown')} · {value}"
-                ),
-                key="factor_detail_selector",
-            )
-            _render_factor_detail(factor_by_id[detail_factor_id], library_root)
 
 
 st.set_page_config(page_title="QuantBacktest", layout="wide")
