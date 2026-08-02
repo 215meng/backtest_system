@@ -18,6 +18,7 @@ from quantbacktest.library import (
     create_candidate_from_upload,
     list_completed_runs,
     list_factors,
+    open_html_report,
 )
 from quantbacktest.schemas import RunSpec
 
@@ -25,7 +26,7 @@ from quantbacktest.schemas import RunSpec
 def _show_result(result: RunResult) -> None:
     st.success(f"完成：{result.run_dir}")
     st.json(result.metrics)
-    st.link_button("打开 HTML 报告", (result.run_dir / "report.html").as_uri())
+    _show_report_actions(result.run_dir / "report.html", key=f"run_{result.run_dir}")
     for file_name, title in (("risk_events.csv", "回撤止损事件"), ("trades.csv", "交易明细")):
         path = result.run_dir / file_name
         if path.exists():
@@ -58,6 +59,31 @@ def _load_yaml(uploaded: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TypeError("YAML 配置根节点必须是对象")
     return payload
+
+
+def _show_report_actions(report_path: Path, key: str) -> None:
+    if not report_path.is_file():
+        return
+    button_key = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    with st.container(horizontal=True):
+        if st.button(
+            "在本机浏览器打开 HTML 报告",
+            key=f"open_report_{button_key}",
+            icon=":material/open_in_new:",
+        ):
+            try:
+                open_html_report(report_path)
+                st.success("已请求系统默认浏览器打开报告。")
+            except LibraryError as exc:
+                st.error(str(exc))
+        st.download_button(
+            "下载 HTML 报告",
+            report_path.read_bytes(),
+            file_name=report_path.name,
+            mime="text/html",
+            key=f"download_report_{button_key}",
+            icon=":material/download:",
+        )
 
 
 def _show_factor_research_contract() -> None:
@@ -213,8 +239,17 @@ def _render_factor_library() -> None:
                 format_func=lambda value: f"{approved_by_id[value]['name']} · {value}",
             )
             report_path = library_root / "artifacts" / report_factor_id / "report.html"
-            if report_path.exists():
-                st.link_button("打开 HTML 报告", report_path.resolve().as_uri(), icon=":material/open_in_new:")
+            _show_report_actions(report_path, key=f"library_{report_factor_id}")
+            results_path = library_root / "artifacts" / report_factor_id / "backtest_results"
+            if results_path.is_dir():
+                with st.expander("已封存的完整回测工件", expanded=False):
+                    st.dataframe(
+                        [
+                            {"文件": path.name, "字节": path.stat().st_size}
+                            for path in sorted(results_path.iterdir())
+                            if path.is_file()
+                        ]
+                    )
 
 
 st.set_page_config(page_title="QuantBacktest", layout="wide")

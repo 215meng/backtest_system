@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import sqlite3
+import webbrowser
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +121,27 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _copy_backtest_results(run_dir: Path, destination: Path) -> None:
+    """封存运行目录中的全部结果工件，不复制因子脚本和主配置快照。"""
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    excluded = {"factor_snapshot.py", "run_spec.json"}
+    for source in run_dir.iterdir():
+        if source.is_file() and source.name not in excluded:
+            shutil.copy2(source, destination / source.name)
+
+
+def open_html_report(report_path: Path) -> str:
+    """在本机默认浏览器中打开因子库或运行目录的离线 HTML 报告。"""
+    path = report_path.expanduser().resolve()
+    if not path.is_file() or path.suffix.lower() != ".html":
+        raise LibraryError(f"未找到可打开的 HTML 报告：{path}")
+    if not webbrowser.open_new_tab(path.as_uri()):
+        raise LibraryError("系统默认浏览器未能打开 HTML 报告")
+    return str(path)
+
+
 def _create_candidate(
     *,
     name: str,
@@ -129,6 +151,7 @@ def _create_candidate(
     source_run: str,
     metrics_json: str,
     report_source: Path | None,
+    run_source: Path | None,
     library_root: Path,
 ) -> dict[str, str]:
     script_hash = hashlib.sha256(script_content).hexdigest()
@@ -149,6 +172,8 @@ def _create_candidate(
                 (artifact / "candidate_metrics.json").write_text(metrics_json, encoding="utf-8")
             if report_source is not None:
                 shutil.copy2(report_source, artifact / "candidate_report.html")
+            if run_source is not None:
+                _copy_backtest_results(run_source, artifact / "backtest_results")
             now = datetime.now(UTC).isoformat()
             _write_json(
                 artifact / "candidate_metadata.json",
@@ -193,6 +218,7 @@ def create_candidate_from_run(run_dir: Path, library_root: Path) -> dict[str, st
         source_run=str(run.directory),
         metrics_json=run.metrics_json,
         report_source=run.directory / "report.html",
+        run_source=run.directory,
         library_root=library_root,
     )
 
@@ -222,6 +248,7 @@ def create_candidate_from_upload(
         source_run="",
         metrics_json="{}",
         report_source=None,
+        run_source=None,
         library_root=library_root,
     )
 
@@ -244,8 +271,7 @@ def approve_candidate(factor_id: str, evidence_run_dir: Path, library_root: Path
         shutil.copy2(run.directory / "metrics.json", artifact / "metrics.json")
         shutil.copy2(run.directory / "report.html", artifact / "report.html")
         shutil.copy2(run.directory / "run_spec.json", artifact / "evidence_run_spec.json")
-        for source in run.directory.glob("research_*.csv"):
-            shutil.copy2(source, artifact / source.name)
+        _copy_backtest_results(run.directory, artifact / "backtest_results")
         now = datetime.now(UTC).isoformat()
         _write_json(
             artifact / "approval_metadata.json",

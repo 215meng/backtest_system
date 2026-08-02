@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -13,6 +14,7 @@ from quantbacktest.library import (
     create_candidate_from_upload,
     list_completed_runs,
     list_factors,
+    open_html_report,
     promote,
 )
 
@@ -45,6 +47,10 @@ def _completed_run(tmp_path: Path, script: bytes, name: str = "library_case") ->
     (run_dir / "metrics.json").write_text(json.dumps({"total_return": 0.1}), encoding="utf-8")
     (run_dir / "report.html").write_text("<html>report</html>", encoding="utf-8")
     (run_dir / "returns.csv").write_text("timestamp,strategy_return\n", encoding="utf-8")
+    (run_dir / "positions.csv").write_text("timestamp,symbol,target_weight\n", encoding="utf-8")
+    (run_dir / "trades.csv").write_text("timestamp,symbol,cost\n", encoding="utf-8")
+    (run_dir / "debug_trace.json").write_text("{}", encoding="utf-8")
+    (run_dir / "model.pkl").write_bytes(b"model")
     return run_dir
 
 
@@ -60,6 +66,9 @@ def test_create_candidate_from_completed_run_keeps_preview_evidence(tmp_path: Pa
     assert (artifact / "factor_snapshot.py").read_bytes() == script
     assert (artifact / "candidate_metrics.json").exists()
     assert (artifact / "candidate_report.html").exists()
+    assert (artifact / "backtest_results" / "positions.csv").exists()
+    assert (artifact / "backtest_results" / "debug_trace.json").exists()
+    assert (artifact / "backtest_results" / "model.pkl").read_bytes() == b"model"
     assert list_factors(library_root, status="candidate")[0]["source_type"] == "completed_run"
     assert list_completed_runs(tmp_path) == [
         {"run_dir": str(run_dir.resolve()), "name": "library_case", "script_hash": hashlib.sha256(script).hexdigest()}
@@ -101,6 +110,7 @@ def test_candidate_requires_matching_completed_run_to_be_approved(tmp_path: Path
     assert approved["status"] == "approved"
     assert (artifact / "metrics.json").exists()
     assert (artifact / "report.html").exists()
+    assert (artifact / "backtest_results" / "trades.csv").exists()
     record = list_factors(library_root, status="approved")[0]
     assert record["evidence_run"] == str(evidence.resolve())
 
@@ -164,3 +174,16 @@ def test_legacy_promote_still_creates_an_approved_factor(tmp_path: Path) -> None
     result = promote(run_dir, tmp_path / "library")
 
     assert result["status"] == "approved"
+
+
+def test_open_html_report_uses_the_local_default_browser(tmp_path: Path) -> None:
+    report = tmp_path / "report.html"
+    report.write_text("<html>report</html>", encoding="utf-8")
+
+    with patch("quantbacktest.library.webbrowser.open_new_tab", return_value=True) as open_browser:
+        opened = open_html_report(report)
+
+    assert opened == str(report.resolve())
+    open_browser.assert_called_once_with(report.resolve().as_uri())
+    with pytest.raises(LibraryError, match="HTML 报告"):
+        open_html_report(tmp_path / "missing.html")
