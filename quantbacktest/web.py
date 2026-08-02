@@ -1,36 +1,102 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 import yaml
 
-from quantbacktest.engine import run_backtest
+from quantbacktest.engine import RunResult, run_backtest
+from quantbacktest.imports import prepare_imported_run
 from quantbacktest.library import list_factors
 from quantbacktest.schemas import RunSpec
 
+
+def _show_result(result: RunResult) -> None:
+    st.success(f"完成：{result.run_dir}")
+    st.json(result.metrics)
+    st.link_button("打开 HTML 报告", (result.run_dir / "report.html").as_uri())
+    for file_name, title in (("risk_events.csv", "回撤止损事件"), ("trades.csv", "交易明细")):
+        path = result.run_dir / file_name
+        if path.exists():
+            st.download_button(title, path.read_bytes(), file_name=file_name, mime="text/csv")
+    trace = result.run_dir / "debug_trace.json"
+    if trace.exists():
+        st.subheader("调试轨迹")
+        st.json(json.loads(trace.read_text(encoding="utf-8")))
+
+
+def _date_from_payload(payload: dict[str, Any], field: str) -> date:
+    raw_value = payload.get("data", {}).get(field)
+    if raw_value:
+        return date.fromisoformat(str(raw_value)[:10])
+    return datetime.now(UTC).date()
+
+
+def _load_yaml(uploaded: Any) -> dict[str, Any]:
+    payload = yaml.safe_load(uploaded.getvalue().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("YAML 配置根节点必须是对象")
+    return payload
+
+
 st.set_page_config(page_title="QuantBacktest", layout="wide")
 st.title("QuantBacktest 加密货币因子研究台")
-st.caption("选择 YAML 配置后运行；报告与调试轨迹保存在调用项目的 results/backtests 目录。")
+st.caption("信号在收盘生成、默认于下一根开盘成交；回测结果保存在调用项目的 results/backtests。")
 
-uploaded = st.file_uploader("回测配置（YAML）", type=["yaml", "yml"])
-if uploaded:
-    payload = yaml.safe_load(uploaded.getvalue().decode("utf-8"))
+st.header("外部项目导入回测")
+st.info("仅上传你自己编写或已审核的可信 Python 因子脚本；该脚本会在本机执行。")
+source_root = st.text_input("源项目绝对目录", placeholder=r"E:\py\my_factor_project")
+factor_upload = st.file_uploader("因子脚本（.py）", type=["py"], key="import_factor")
+config_upload = st.file_uploader("回测配置（.yaml / .yml）", type=["yaml", "yml"], key="import_config")
+
+if config_upload is not None:
     try:
-        spec = RunSpec.model_validate(payload)
+        import_payload = _load_yaml(config_upload)
+        default_start = _date_from_payload(import_payload, "start")
+        default_end = _date_from_payload(import_payload, "end")
+        date_left, date_right = st.columns(2)
+        start_date = date_left.date_input("回测开始日期（UTC）", value=default_start, key="import_start")
+        end_date = date_right.date_input("回测结束日期（UTC）", value=default_end, key="import_end")
+        if end_date < start_date:
+            st.error("回测结束日期不能早于开始日期")
+        elif factor_upload is not None:
+            factor_hash = hashlib.sha256(factor_upload.getvalue()).hexdigest()
+            st.caption(f"因子 SHA-256：{factor_hash}；结果目录：<源项目>/results/backtests")
+            trusted = st.checkbox("我确认该 Python 脚本可信，并允许本机执行", key="trusted_factor")
+            if st.button("导入并运行回测", type="primary", disabled=not trusted):
+                prepared = prepare_imported_run(
+                    factor_name=factor_upload.name,
+                    factor_content=factor_upload.getvalue(),
+                    config_content=config_upload.getvalue(),
+                    source_root=source_root,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                st.subheader("最终标准化配置")
+                st.code(prepared.normalized_yaml, language="yaml")
+                result = run_backtest(prepared.spec, prepared.source_root)
+                (result.run_dir / "imported_run_spec.yaml").write_text(
+                    prepared.normalized_yaml, encoding="utf-8"
+                )
+                _show_result(result)
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        st.error(str(exc))
+
+st.divider()
+st.header("当前项目 YAML 回测")
+uploaded = st.file_uploader("回测配置（YAML）", type=["yaml", "yml"], key="local_config")
+if uploaded:
+    try:
+        spec = RunSpec.model_validate(_load_yaml(uploaded))
         st.success("输入规范校验通过")
         st.json(spec.model_dump(mode="json"))
-        if st.button("运行回测", type="primary"):
-            result = run_backtest(spec, Path.cwd())
-            st.success(f"完成：{result.run_dir}")
-            st.json(result.metrics)
-            st.link_button("打开 HTML 报告", (result.run_dir / "report.html").as_uri())
-            trace = result.run_dir / "debug_trace.json"
-            if trace.exists():
-                st.subheader("调试轨迹")
-                st.json(json.loads(trace.read_text(encoding="utf-8")))
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+        if st.button("运行当前项目回测", type="primary"):
+            _show_result(run_backtest(spec, Path.cwd()))
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         st.error(str(exc))
 
 st.subheader("已批准因子库")

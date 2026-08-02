@@ -28,6 +28,15 @@ class RunResult:
     warnings: list[str]
 
 
+@dataclass
+class SimulationResult:
+    returns: pd.Series
+    positions: pd.DataFrame
+    trades: pd.DataFrame
+    risk_events: pd.DataFrame
+    cash_bar_ratio: float
+
+
 def _forward_returns(frame: pd.DataFrame, holding_bars: int) -> pd.DataFrame:
     frame = frame.copy()
     grouped = frame.groupby("symbol", group_keys=False)
@@ -81,18 +90,204 @@ def _single_asset_positions(frame: pd.DataFrame, spec: RunSpec) -> pd.DataFrame:
     return active
 
 
-def _portfolio_returns(positions: pd.DataFrame, spec: RunSpec) -> tuple[pd.Series, pd.DataFrame]:
+def _simulate_portfolio(frame: pd.DataFrame, positions: pd.DataFrame, spec: RunSpec) -> SimulationResult:
+    """Simulate close signals, next-open execution and an optional portfolio drawdown stop."""
     positions = positions.sort_values(["timestamp", "symbol"]).copy()
-    positions["previous_weight"] = positions.groupby("symbol")["target_weight"].shift().fillna(0.0)
-    positions["turnover"] = (positions["target_weight"] - positions["previous_weight"]).abs()
-    costs = (spec.costs.fee_bps + spec.costs.slippage_bps) / 10_000
-    positions["cost"] = positions["turnover"] * costs
-    positions["contribution"] = positions["target_weight"] * positions["forward_return"] - positions["cost"]
-    returns = positions.groupby("timestamp")["contribution"].sum().rename("strategy_return")
-    return returns, positions
+    timestamps = pd.Index(frame["timestamp"].drop_duplicates().sort_values())
+    if len(timestamps) < 2:
+        raise ValueError("至少需要两根 K 线才能执行下一开盘成交的回测")
+    bars = {
+        timestamp: group.set_index("symbol")[["open", "close"]]
+        for timestamp, group in frame.groupby("timestamp", sort=True)
+    }
+    signal_targets = {
+        timestamp: group.loc[group["target_weight"] != 0, ["symbol", "target_weight"]]
+        .set_index("symbol")["target_weight"]
+        .to_dict()
+        for timestamp, group in positions.groupby("timestamp", sort=True)
+    }
+    cost_rate = (spec.costs.fee_bps + spec.costs.slippage_bps) / 10_000
+    stop = spec.strategy.risk_control.max_drawdown_stop
+
+    current_weights: dict[str, float] = {}
+    pending_targets: dict[pd.Timestamp, tuple[dict[str, float], int]] = {}
+    active_exit_index: int | None = None
+    force_exit_at: pd.Timestamp | None = None
+    pending_risk_event: int | None = None
+    equity = 1.0
+    peak_equity = 1.0
+    previous_closes: pd.Series | None = None
+    returns: dict[pd.Timestamp, float] = {}
+    trade_records: list[dict[str, Any]] = []
+    risk_records: list[dict[str, Any]] = []
+    in_stop_cooldown = False
+    stop_cash_bars = 0
+
+    def _weighted_return(weights: dict[str, float], start: pd.Series, end: pd.Series) -> float:
+        result = 0.0
+        for symbol, weight in weights.items():
+            if symbol not in start.index or symbol not in end.index:
+                raise ValueError(f"持仓 {symbol} 在 {timestamp} 缺少开盘或收盘价格")
+            start_price, end_price = float(start[symbol]), float(end[symbol])
+            if start_price <= 0 or end_price <= 0:
+                raise ValueError(f"持仓 {symbol} 在 {timestamp} 存在非正价格")
+            result += weight * (end_price / start_price - 1.0)
+        return result
+
+    def _trade_to(
+        timestamp: pd.Timestamp, desired: dict[str, float], reason: str, prices: pd.Series
+    ) -> float:
+        nonlocal current_weights
+        turnover = 0.0
+        for symbol in sorted(set(current_weights) | set(desired)):
+            previous_weight = current_weights.get(symbol, 0.0)
+            target_weight = desired.get(symbol, 0.0)
+            change = target_weight - previous_weight
+            if not change:
+                continue
+            if symbol not in prices.index:
+                raise ValueError(f"交易 {symbol} 在 {timestamp} 缺少开盘成交价格")
+            item_turnover = abs(change)
+            item_cost = item_turnover * cost_rate
+            turnover += item_turnover
+            trade_records.append(
+                {
+                    "timestamp": timestamp,
+                    "symbol": symbol,
+                    "previous_weight": previous_weight,
+                    "target_weight": target_weight,
+                    "execution_price": float(prices[symbol]),
+                    "turnover": item_turnover,
+                    "cost": item_cost,
+                    "reason": reason,
+                }
+            )
+        current_weights = {symbol: weight for symbol, weight in desired.items() if weight}
+        return turnover * cost_rate
+
+    for index, timestamp in enumerate(timestamps):
+        bar = bars[timestamp]
+        opens, closes = bar["open"], bar["close"]
+        equity_before_bar = equity
+        just_liquidated = False
+        if previous_closes is not None and current_weights:
+            equity *= 1.0 + _weighted_return(current_weights, previous_closes, opens)
+
+        forced_exit = force_exit_at == timestamp
+        if forced_exit:
+            execution_cost = _trade_to(timestamp, {}, "drawdown_stop", opens)
+            equity *= 1.0 - execution_cost
+            active_exit_index = None
+            force_exit_at = None
+            peak_equity = equity
+            just_liquidated = True
+            if pending_risk_event is not None:
+                risk_records[pending_risk_event].update(
+                    {
+                        "liquidation_cost": execution_cost,
+                        "liquidation_equity": equity,
+                    }
+                )
+                pending_risk_event = None
+        elif timestamp in pending_targets:
+            desired, active_exit_index = pending_targets.pop(timestamp)
+            equity *= 1.0 - _trade_to(timestamp, desired, "rebalance", opens)
+            if desired:
+                in_stop_cooldown = False
+        elif active_exit_index == index:
+            equity *= 1.0 - _trade_to(timestamp, {}, "holding_period_exit", opens)
+            active_exit_index = None
+
+        if current_weights:
+            equity *= 1.0 + _weighted_return(current_weights, opens, closes)
+        elif in_stop_cooldown:
+            stop_cash_bars += 1
+        if equity <= 0:
+            raise ValueError("组合净值降至零或以下，无法继续计算回撤止损")
+        returns[timestamp] = equity / equity_before_bar - 1.0
+        peak_equity = max(peak_equity, equity)
+        drawdown = equity / peak_equity - 1.0
+
+        if (
+            stop.enabled
+            and not just_liquidated
+            and force_exit_at is None
+            and drawdown <= -(stop.threshold or 0)
+            and index + 1 < len(timestamps)
+        ):
+            force_exit_at = timestamps[index + 1]
+            in_stop_cooldown = True
+            risk_records.append(
+                {
+                    "trigger_time": timestamp,
+                    "liquidation_time": force_exit_at,
+                    "trigger_drawdown": drawdown,
+                    "peak_equity": peak_equity,
+                    "trigger_equity": equity,
+                    "liquidation_cost": None,
+                    "liquidation_equity": None,
+                    "reentry_time": None,
+                }
+            )
+            pending_risk_event = len(risk_records) - 1
+            previous_closes = closes
+            continue
+
+        if index + 1 < len(timestamps) and timestamp in signal_targets:
+            target_weights = signal_targets[timestamp]
+            pending_targets[timestamps[index + 1]] = (
+                target_weights,
+                min(index + spec.strategy.execution.holding_bars + 1, len(timestamps) - 1),
+            )
+            if target_weights and risk_records and risk_records[-1]["reentry_time"] is None:
+                risk_records[-1]["reentry_time"] = timestamps[index + 1]
+        previous_closes = closes
+
+    trades = pd.DataFrame(trade_records)
+    if trades.empty:
+        trades = pd.DataFrame(
+            columns=[
+                "timestamp",
+                "symbol",
+                "previous_weight",
+                "target_weight",
+                "execution_price",
+                "turnover",
+                "cost",
+                "reason",
+            ]
+        )
+    risk_events = pd.DataFrame(risk_records)
+    if risk_events.empty:
+        risk_events = pd.DataFrame(
+            columns=[
+                "trigger_time",
+                "liquidation_time",
+                "trigger_drawdown",
+                "peak_equity",
+                "trigger_equity",
+                "liquidation_cost",
+                "liquidation_equity",
+                "reentry_time",
+            ]
+        )
+    positions["turnover"] = 0.0
+    positions["cost"] = 0.0
+    return SimulationResult(
+        returns=pd.Series(returns, name="strategy_return"),
+        positions=positions,
+        trades=trades,
+        risk_events=risk_events,
+        cash_bar_ratio=stop_cash_bars / len(timestamps),
+    )
 
 
-def _trace(frame: pd.DataFrame, positions: pd.DataFrame | None) -> dict[str, Any]:
+def _trace(
+    frame: pd.DataFrame,
+    positions: pd.DataFrame | None,
+    trades: pd.DataFrame | None = None,
+    risk_events: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     trace: dict[str, Any] = {
         "data": {
             "rows": len(frame),
@@ -111,6 +306,13 @@ def _trace(frame: pd.DataFrame, positions: pd.DataFrame | None) -> dict[str, Any
             "sample": positions[["timestamp", "symbol", "factor", "target_weight", "forward_return", "cost"]]
             .head(20)
             .to_dict("records"),
+        }
+    if trades is not None:
+        trace["execution"] = {"trades": len(trades), "sample": trades.head(20).to_dict("records")}
+    if risk_events is not None:
+        trace["risk_control"] = {
+            "stop_events": len(risk_events),
+            "events": risk_events.to_dict("records"),
         }
     return trace
 
@@ -158,6 +360,7 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
     frame, ml_meta = train_oos_model(frame, spec.ml, run_dir / "model.pkl")
     base_meta = {"name": spec.name, "warnings": warnings, "data": data_meta, "factor": factor_meta}
     base_meta["ml"] = ml_meta
+    base_meta["risk_control"] = spec.strategy.risk_control.model_dump(mode="json")
     write_json(run_dir / "run_spec.json", spec.model_dump(mode="json"))
     write_json(run_dir / "metadata.json", base_meta)
     if spec.debug.mode is DebugMode.dry_run:
@@ -170,21 +373,28 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
         positions = _single_asset_positions(frame, spec)
     if positions.empty:
         raise ValueError("没有可交易的有效信号；请检查因子覆盖、资产池和持有期")
-    returns, positions = _portfolio_returns(positions, spec)
+    simulation = _simulate_portfolio(frame, positions, spec)
+    returns = simulation.returns
+    positions = simulation.positions
     benchmark = equal_weight_benchmark(frame)
     diagnostics = factor_diagnostics(frame)
     metrics = performance_metrics(returns, spec.data.frequency)
     metrics.update({key: value for key, value in diagnostics.items() if key != "ic_series"})
-    metrics["total_turnover"] = float(positions["turnover"].sum())
-    metrics["total_cost"] = float(positions["cost"].sum())
+    metrics["total_turnover"] = float(simulation.trades["turnover"].sum())
+    metrics["total_cost"] = float(simulation.trades["cost"].sum())
+    metrics["risk_stop_trigger_count"] = len(simulation.risk_events)
+    metrics["risk_stop_cost"] = float(simulation.risk_events["liquidation_cost"].fillna(0).sum())
+    metrics["stop_cash_bar_ratio"] = simulation.cash_bar_ratio
     metrics["warnings"] = warnings
     returns.to_csv(run_dir / "returns.csv", header=True)
     positions.to_csv(run_dir / "positions.csv", index=False)
+    simulation.trades.to_csv(run_dir / "trades.csv", index=False)
+    simulation.risk_events.to_csv(run_dir / "risk_events.csv", index=False)
     diagnostics["ic_series"].rename("ic").to_csv(run_dir / "ic.csv", header=True)
     quantile = quantile_returns(frame, spec.strategy.quantiles or 5)
     quantile.to_csv(run_dir / "quantile_returns.csv")
     if spec.debug.mode in {DebugMode.trace, DebugMode.replay}:
-        write_json(run_dir / "debug_trace.json", _trace(frame, positions))
+        write_json(run_dir / "debug_trace.json", _trace(frame, positions, simulation.trades, simulation.risk_events))
     write_json(run_dir / "metrics.json", metrics)
-    render_report(run_dir / "report.html", returns, benchmark, metrics, base_meta)
+    render_report(run_dir / "report.html", returns, benchmark, metrics, base_meta, simulation.risk_events)
     return RunResult(run_dir, metrics, warnings)

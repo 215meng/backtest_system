@@ -39,3 +39,24 @@ def test_single_asset_requires_signal_rule() -> None:
     payload["strategy"] = {"mode": "single_asset", "symbol": "BTCUSDT"}
     with pytest.raises(ValidationError, match="signal_rule"):
         RunSpec.model_validate(payload)
+
+
+def test_max_drawdown_stop_defaults_to_disabled() -> None:
+    spec = RunSpec.model_validate(base_payload())
+    stop = spec.strategy.risk_control.max_drawdown_stop
+    assert stop.enabled is False
+    assert stop.threshold is None
+
+
+def test_max_drawdown_stop_requires_valid_threshold() -> None:
+    payload = base_payload()
+    payload["strategy"]["risk_control"] = {"max_drawdown_stop": {"enabled": True, "threshold": 0.15}}
+    assert RunSpec.model_validate(payload).strategy.risk_control.max_drawdown_stop.threshold == 0.15
+
+    payload["strategy"]["risk_control"] = {"max_drawdown_stop": {"enabled": True}}
+    with pytest.raises(ValidationError, match="threshold"):
+        RunSpec.model_validate(payload)
+
+    payload["strategy"]["risk_control"] = {"max_drawdown_stop": {"enabled": True, "threshold": 1.0}}
+    with pytest.raises(ValidationError):
+        RunSpec.model_validate(payload)

@@ -65,6 +65,21 @@ class SignalRule(StrictModel):
     position_size: float = Field(default=1.0, gt=0, le=1.0)
 
 
+class MaxDrawdownStopSpec(StrictModel):
+    enabled: bool = False
+    threshold: float | None = Field(default=None, gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def validate_threshold(self) -> MaxDrawdownStopSpec:
+        if self.enabled and self.threshold is None:
+            raise ValueError("启用组合最大回撤止损时必须提供 threshold")
+        return self
+
+
+class RiskControlSpec(StrictModel):
+    max_drawdown_stop: MaxDrawdownStopSpec = Field(default_factory=MaxDrawdownStopSpec)
+
+
 class StrategySpec(StrictModel):
     mode: StrategyMode
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
@@ -78,6 +93,7 @@ class StrategySpec(StrictModel):
     symbol: str | None = None
     signal_rule: SignalRule | None = None
     hook_callable: str | None = None
+    risk_control: RiskControlSpec = Field(default_factory=RiskControlSpec)
 
     @model_validator(mode="after")
     def validate_mode(self) -> StrategySpec:

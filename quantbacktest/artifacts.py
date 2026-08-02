@@ -38,6 +38,7 @@ def render_report(
     benchmark: pd.Series,
     metrics: dict[str, Any],
     provenance: dict[str, Any],
+    risk_events: pd.DataFrame | None = None,
 ) -> None:
     equity = (1 + returns.fillna(0)).cumprod()
     benchmark_equity = (1 + benchmark.reindex(returns.index).fillna(0)).cumprod()
@@ -46,14 +47,33 @@ def render_report(
     figure.add_trace(go.Scatter(x=equity.index, y=equity, name="策略净值"), row=1, col=1)
     figure.add_trace(go.Scatter(x=benchmark_equity.index, y=benchmark_equity, name="等权基准"), row=1, col=1)
     figure.add_trace(go.Scatter(x=drawdown.index, y=drawdown, name="回撤", fill="tozeroy"), row=2, col=1)
+    if risk_events is not None and not risk_events.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=pd.to_datetime(risk_events["trigger_time"], utc=True),
+                y=risk_events["trigger_drawdown"].astype(float),
+                name="回撤止损触发",
+                mode="markers",
+                marker={"color": "crimson", "size": 10, "symbol": "x"},
+                hovertemplate="触发时间=%{x}<br>回撤=%{y:.2%}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
     figure.update_layout(title=provenance.get("name", "回测报告"), template="plotly_white", height=750)
-    metric_html = "".join(f"<li><b>{key}</b>: {value}</li>" for key, value in metrics.items() if not isinstance(value, (dict, list)))
-    warning = provenance.get("warnings", [])
-    warning_html = "".join(f"<li>{item}</li>" for item in warning)
+    metric_html = "".join(
+        f"<li><b>{key}</b>: {value}</li>"
+        for key, value in metrics.items()
+        if not isinstance(value, (dict, list))
+    )
+    warning_html = "".join(f"<li>{item}</li>" for item in provenance.get("warnings", []))
+    risk_html = ""
+    if risk_events is not None and not risk_events.empty:
+        risk_html = f"<h2>回撤止损事件</h2>{risk_events.to_html(index=False, border=0)}"
     path.write_text(
         "<html><meta charset='utf-8'><body>"
         f"<h1>{provenance.get('name')}</h1><h2>指标</h2><ul>{metric_html}</ul>"
-        f"<h2>数据与复现警告</h2><ul>{warning_html}</ul>"
+        f"<h2>数据与复现警告</h2><ul>{warning_html}</ul>{risk_html}"
         f"{figure.to_html(full_html=False, include_plotlyjs=True)}"
         "</body></html>",
         encoding="utf-8",
