@@ -1,0 +1,29 @@
+name: simple_factor_smoke_test
+data:
+  adapter: crypto_top50
+  path: data/raw/crypto_top50
+  market: spot
+  frequency: 1h
+  symbols: [BTCUSDT, ETHUSDT, ADAUSDT, BNBUSDT, DOGEUSDT, DOTUSDT, LINKUSDT, LTCUSDT, SOLUSDT, XRPUSDT]
+  start: 2024-01-01T00:00:00
+  end: 2024-01-07T00:00:00
+factor:
+  module_path: examples/simple_test_factor.py
+strategy:
+  mode: cross_sectional
+  selection: top_k
+  long_short: long_only
+  top_k: 2
+  weighting: equal
+  rebalance_bars: 24
+  execution:
+    holding_bars: 24
+costs:
+  fee_bps: 0
+  slippage_bps: 0
+debug:
+  mode: trace
+output:
+  root: results/backtests
+provenance:
+  notes: 仅用于验证因子脚本、输入规范和完整回测流水线的最小样例。
