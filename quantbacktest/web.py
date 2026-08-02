@@ -11,7 +11,14 @@ import yaml
 
 from quantbacktest.engine import RunResult, run_backtest
 from quantbacktest.imports import prepare_imported_run
-from quantbacktest.library import list_factors
+from quantbacktest.library import (
+    LibraryError,
+    approve_candidate,
+    create_candidate_from_run,
+    create_candidate_from_upload,
+    list_completed_runs,
+    list_factors,
+)
 from quantbacktest.schemas import RunSpec
 
 
@@ -84,6 +91,132 @@ def _show_factor_research_contract() -> None:
         )
 
 
+def _completed_run_options() -> list[dict[str, str]]:
+    return list_completed_runs(Path("results/backtests"))
+
+
+def _render_factor_library() -> None:
+    library_root = Path("factor_library")
+    completed_runs = _completed_run_options()
+    run_paths = [item["run_dir"] for item in completed_runs]
+    run_labels = {
+        item["run_dir"]: f"{item['name']} · {Path(item['run_dir']).name}" for item in completed_runs
+    }
+
+    st.header("因子库")
+    st.caption("所有新条目先保存为 candidate。上传候选不会执行 Python，批准时必须关联同一脚本快照的成功回测。")
+    with st.container(border=True):
+        source = st.segmented_control(
+            "候选来源",
+            ["完成回测结果", "直接上传脚本 + YAML"],
+            default="完成回测结果",
+            required=True,
+            key="library_candidate_source",
+        )
+        if source == "完成回测结果":
+            with st.form("create_candidate_from_run"):
+                selected_run = st.selectbox(
+                    "本项目已完成运行",
+                    [""] + run_paths,
+                    format_func=lambda value: "请选择或填写外部运行目录"
+                    if not value
+                    else run_labels[value],
+                )
+                manual_run = st.text_input("外部项目运行目录（绝对路径，可选）")
+                create_from_run = st.form_submit_button("创建候选", icon=":material/add:")
+            if create_from_run:
+                try:
+                    result = create_candidate_from_run(Path(manual_run or selected_run), library_root)
+                    st.success(f"已创建候选：{result['factor_id']}")
+                except (LibraryError, OSError, ValueError) as exc:
+                    st.error(str(exc))
+        else:
+            with st.form("create_candidate_from_upload"):
+                factor_file = st.file_uploader(
+                    "因子脚本（.py）", type=["py"], key="library_candidate_factor"
+                )
+                config_file = st.file_uploader(
+                    "回测配置（.yaml 或 .yml）",
+                    type=["yaml", "yml"],
+                    key="library_candidate_config",
+                )
+                create_from_upload = st.form_submit_button("创建候选", icon=":material/upload_file:")
+            if factor_file is not None and config_file is not None:
+                try:
+                    preview_spec = RunSpec.model_validate(_load_yaml(config_file))
+                    script_hash = hashlib.sha256(factor_file.getvalue()).hexdigest()
+                    st.caption(f"候选名称：{preview_spec.name}；脚本 SHA-256：{script_hash}")
+                except (TypeError, ValueError, yaml.YAMLError) as exc:
+                    st.error(f"YAML 配置预览失败：{exc}")
+            if create_from_upload:
+                try:
+                    if factor_file is None or config_file is None:
+                        raise LibraryError("请同时选择 Python 因子脚本和 YAML 回测配置")
+                    result = create_candidate_from_upload(
+                        factor_file.getvalue(),
+                        config_file.getvalue(),
+                        factor_file.name,
+                        library_root,
+                    )
+                    st.success(f"已创建候选：{result['factor_id']}；脚本未执行。")
+                except (LibraryError, OSError, ValueError, yaml.YAMLError) as exc:
+                    st.error(str(exc))
+
+    candidates = list_factors(library_root, status="candidate")
+    with st.container(border=True):
+        st.subheader("候选审核")
+        if not candidates:
+            st.info("暂无候选因子。候选尚未获得可复现回测证据。")
+        else:
+            st.dataframe(candidates)
+            candidate_by_id = {item["factor_id"]: item for item in candidates}
+            with st.form("approve_candidate"):
+                factor_id = st.selectbox(
+                    "候选因子",
+                    list(candidate_by_id),
+                    format_func=lambda value: f"{candidate_by_id[value]['name']} · {value}",
+                )
+                selected_evidence = st.selectbox(
+                    "本项目成功回测证据",
+                    [""] + run_paths,
+                    format_func=lambda value: "请选择或填写外部运行目录"
+                    if not value
+                    else run_labels[value],
+                )
+                manual_evidence = st.text_input("外部项目证据运行目录（绝对路径，可选）")
+                confirmed = st.checkbox("我确认该运行使用与候选完全一致的因子脚本快照")
+                approve = st.form_submit_button("批准为正式因子", icon=":material/verified:")
+            if approve:
+                try:
+                    if not confirmed:
+                        raise LibraryError("请确认回测证据使用同一因子脚本快照")
+                    result = approve_candidate(
+                        factor_id,
+                        Path(manual_evidence or selected_evidence),
+                        library_root,
+                    )
+                    st.success(f"已批准因子：{result['factor_id']}")
+                except (LibraryError, OSError, ValueError) as exc:
+                    st.error(str(exc))
+
+    approved = list_factors(library_root, status="approved")
+    with st.container(border=True):
+        st.subheader("已批准因子")
+        if not approved:
+            st.info("暂无已批准因子。")
+        else:
+            st.dataframe(approved)
+            approved_by_id = {item["factor_id"]: item for item in approved}
+            report_factor_id = st.selectbox(
+                "查看批准因子的报告",
+                list(approved_by_id),
+                format_func=lambda value: f"{approved_by_id[value]['name']} · {value}",
+            )
+            report_path = library_root / "artifacts" / report_factor_id / "report.html"
+            if report_path.exists():
+                st.link_button("打开 HTML 报告", report_path.resolve().as_uri(), icon=":material/open_in_new:")
+
+
 st.set_page_config(page_title="QuantBacktest", layout="wide")
 st.title("QuantBacktest 加密货币因子研究台")
 st.caption("信号在收盘生成、默认于下一根开盘成交；回测结果保存在调用项目的 results/backtests。")
@@ -141,8 +274,8 @@ if uploaded:
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         st.error(str(exc))
 
-st.subheader("已批准因子库")
+st.divider()
 try:
-    st.dataframe(list_factors(Path("factor_library")), use_container_width=True)
-except (OSError, ValueError) as exc:
-    st.info(f"尚无已批准因子：{exc}")
+    _render_factor_library()
+except (LibraryError, OSError, ValueError) as exc:
+    st.error(f"因子库不可用：{exc}")
