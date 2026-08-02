@@ -22,6 +22,10 @@ from quantbacktest.library import (
 )
 from quantbacktest.schemas import RunSpec
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LIBRARY_ROOT = PROJECT_ROOT / "factor_library"
+RESULTS_ROOT = PROJECT_ROOT / "results" / "backtests"
+
 
 def _show_result(result: RunResult) -> None:
     st.success(f"完成：{result.run_dir}")
@@ -118,11 +122,11 @@ def _show_factor_research_contract() -> None:
 
 
 def _completed_run_options() -> list[dict[str, str]]:
-    return list_completed_runs(Path("results/backtests"))
+    return list_completed_runs(RESULTS_ROOT)
 
 
 def _render_factor_library() -> None:
-    library_root = Path("factor_library")
+    library_root = LIBRARY_ROOT
     completed_runs = _completed_run_options()
     run_paths = [item["run_dir"] for item in completed_runs]
     run_labels = {
@@ -131,6 +135,7 @@ def _render_factor_library() -> None:
 
     st.header("因子库")
     st.caption("所有新条目先保存为 candidate。上传候选不会执行 Python，批准时必须关联同一脚本快照的成功回测。")
+    st.caption(f"当前因子库路径：{library_root}；回测结果路径：{RESULTS_ROOT}")
     with st.container(border=True):
         source = st.segmented_control(
             "候选来源",
@@ -191,6 +196,7 @@ def _render_factor_library() -> None:
     candidates = list_factors(library_root, status="candidate")
     with st.container(border=True):
         st.subheader("候选审核")
+        st.metric("候选因子数量", len(candidates))
         if not candidates:
             st.info("暂无候选因子。候选尚未获得可复现回测证据。")
         else:
@@ -228,6 +234,7 @@ def _render_factor_library() -> None:
     approved = list_factors(library_root, status="approved")
     with st.container(border=True):
         st.subheader("已批准因子")
+        st.metric("已批准因子数量", len(approved))
         if not approved:
             st.info("暂无已批准因子。")
         else:
