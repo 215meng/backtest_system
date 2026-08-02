@@ -330,6 +330,23 @@ def _render_factor_library() -> None:
         else:
             st.dataframe(_factor_table_rows_ordered(candidates, library_root))
             candidate_by_id = {item["factor_id"]: item for item in candidates}
+            candidate_reports = {
+                factor_id: library_root / "artifacts" / factor_id / "candidate_report.html"
+                for factor_id in candidate_by_id
+                if (library_root / "artifacts" / factor_id / "candidate_report.html").is_file()
+            }
+            if candidate_reports:
+                report_factor_id = st.selectbox(
+                    "查看候选因子的报告",
+                    list(candidate_reports),
+                    format_func=lambda value: f"{candidate_by_id[value]['name']} · {value}",
+                    key="candidate_report_factor",
+                )
+                _show_report_actions(
+                    candidate_reports[report_factor_id], key=f"candidate_{report_factor_id}"
+                )
+            else:
+                st.info("候选尚未关联成功回测证据，暂无 HTML 报告；请先使用同一脚本快照完成回测。")
             with st.form("approve_candidate"):
                 factor_id = st.selectbox(
                     "候选因子",
