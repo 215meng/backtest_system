@@ -1,0 +1,30 @@
+name: btc_momentum_single_asset
+data:
+  adapter: bybit_parquet
+  path: data/raw/bybit
+  market: linear_perp
+  frequency: 1m
+  symbols: [BTCUSDT]
+  start: 2024-01-01T00:00:00
+  end: 2024-01-03T00:00:00
+factor:
+  module_path: examples/momentum_factor.py
+  parameters:
+    lookback_bars: 30
+strategy:
+  mode: single_asset
+  symbol: BTCUSDT
+  signal_rule:
+    kind: threshold
+    long_above: 0.0005
+    short_below: -0.0005
+    position_size: 1.0
+  execution:
+    holding_bars: 5
+costs:
+  fee_bps: 5
+  slippage_bps: 2
+debug:
+  mode: trace
+output:
+  root: results/backtests

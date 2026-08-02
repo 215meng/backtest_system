@@ -1,0 +1,16 @@
+__pycache__/
+*.egg-info/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.streamlit/secrets.toml
+results/
+factor_library/artifacts/
+factor_library/*.sqlite
+data/raw/**
+data/processed/**
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.zip
+*.parquet
