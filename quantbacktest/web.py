@@ -172,6 +172,52 @@ def _factor_table_rows(records: list[dict[str, Any]], library_root: Path) -> lis
     return rows
 
 
+def _factor_table_rows_ordered(records: list[dict[str, Any]], library_root: Path) -> list[dict[str, Any]]:
+    """按研究员指定的顺序生成精简因子指标行。"""
+    required_metrics = (
+        ("平均 IC", ("ic_mean", "rank_ic_mean")),
+        ("IC 标准差", ("ic_std", "rank_ic_std")),
+        ("ICIR", ("icir", "rank_icir")),
+        ("总收益", ("total_return",)),
+        ("年化收益", ("annual_return",)),
+        ("Sharpe", ("sharpe",)),
+        ("最大回撤", ("max_drawdown",)),
+    )
+    optional_metrics = (
+        ("止损触发次数", ("risk_stop_trigger_count",)),
+        ("止损成本", ("risk_stop_cost",)),
+        ("止损现金占比", ("stop_cash_bar_ratio",)),
+        ("市场 Beta", ("market_beta", "beta")),
+        ("市场调整 Alpha", ("market_adjusted_alpha", "alpha")),
+    )
+    metric_values = [_load_factor_metrics(record, library_root) for record in records]
+    visible_optional = [
+        (label, aliases)
+        for label, aliases in optional_metrics
+        if any(any(alias in metrics for alias in aliases) for metrics in metric_values)
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for record, metrics in zip(records, metric_values):
+        row: dict[str, Any] = {
+            "因子 ID": record.get("factor_id"),
+            "名称": record.get("name"),
+            "状态": record.get("status"),
+        }
+        for label, aliases in required_metrics + tuple(visible_optional):
+            value = next((metrics[key] for key in aliases if key in metrics), None)
+            row[label] = "—" if value is None else value
+        warnings = metrics.get("warnings")
+        if isinstance(warnings, list):
+            row["回测警告"] = "；".join(str(item) for item in warnings) or "—"
+        elif warnings:
+            row["回测警告"] = str(warnings)
+        else:
+            row["回测警告"] = "—"
+        rows.append(row)
+    return rows
+
+
 def _show_factor_research_contract() -> None:
     with st.expander("论文因子研究配置说明（新研究默认使用）", expanded=False):
         st.markdown(
@@ -282,7 +328,7 @@ def _render_factor_library() -> None:
         if not candidates:
             st.info("暂无候选因子。候选尚未获得可复现回测证据。")
         else:
-            st.dataframe(_factor_table_rows(candidates, library_root))
+            st.dataframe(_factor_table_rows_ordered(candidates, library_root))
             candidate_by_id = {item["factor_id"]: item for item in candidates}
             with st.form("approve_candidate"):
                 factor_id = st.selectbox(
@@ -320,7 +366,7 @@ def _render_factor_library() -> None:
         if not approved:
             st.info("暂无已批准因子。")
         else:
-            st.dataframe(_factor_table_rows(approved, library_root))
+            st.dataframe(_factor_table_rows_ordered(approved, library_root))
             approved_by_id = {item["factor_id"]: item for item in approved}
             report_factor_id = st.selectbox(
                 "查看批准因子的报告",
