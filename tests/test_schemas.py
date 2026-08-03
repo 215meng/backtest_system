@@ -62,6 +62,27 @@ def test_max_drawdown_stop_requires_valid_threshold() -> None:
         RunSpec.model_validate(payload)
 
 
+def test_factor_mimicking_profile_requires_minimal_strategy_rules() -> None:
+    payload = base_payload()
+    payload["strategy"].update(
+        {
+            "profile": "factor_mimicking",
+            "long_short": "market_neutral",
+            "quantiles": 3,
+            "gross_exposure": 1.0,
+            "rebalance_bars": 24,
+            "execution": {"holding_bars": 24},
+        }
+    )
+    spec = RunSpec.model_validate(payload)
+    assert spec.strategy.profile == "factor_mimicking"
+    assert spec.strategy.gross_exposure == 1.0
+
+    payload["costs"] = {"fee_bps": 1.0}
+    with pytest.raises(ValidationError, match="zero fees"):
+        RunSpec.model_validate(payload)
+
+
 def test_factor_research_requires_explicit_research_contract() -> None:
     payload = base_payload()
     payload.pop("strategy")
@@ -81,3 +102,11 @@ def test_factor_research_requires_explicit_research_contract() -> None:
     spec = RunSpec.model_validate(payload)
     assert spec.strategy is None
     assert spec.evaluation is not None
+
+
+def test_debug_mode_rejects_boolean_with_actionable_message() -> None:
+    payload = base_payload()
+    payload["debug"] = {"mode": False}
+
+    with pytest.raises(ValidationError, match="debug.mode 必须是字符串"):
+        RunSpec.model_validate(payload)

@@ -11,9 +11,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from quantbacktest.config_io import ConfigLoadError, load_yaml_mapping
 from quantbacktest.schemas import RunSpec
+
+CORE_LIBRARY_ROOT = Path(__file__).resolve().parents[1] / "factor_library"
 
 
 class LibraryError(ValueError):
@@ -28,6 +29,7 @@ class CompletedRun:
     script_hash: str
     run_spec_json: str
     metrics_json: str
+    run_kind: str = "legacy"
 
 
 def _connection(root: Path) -> sqlite3.Connection:
@@ -53,6 +55,7 @@ def _connection(root: Path) -> sqlite3.Connection:
         "config_hash": "TEXT NOT NULL DEFAULT ''",
         "approved_at": "TEXT",
         "evidence_run": "TEXT",
+        "strategy_evidence_run": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -64,41 +67,64 @@ def _connection(root: Path) -> sqlite3.Connection:
     return connection
 
 
-def _factor_id(name: str, script_hash: str) -> str:
+def default_library_root() -> Path:
+    """返回 Web 候选审核区使用的核心统一因子库。"""
+    return CORE_LIBRARY_ROOT
+
+
+def _factor_id(name: str, script_hash: str, run_identity: str = "") -> str:
     safe_name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(". ") or "factor"
-    return f"{safe_name}_{script_hash[:12]}"
+    suffix = f"_{hashlib.sha256(run_identity.encode('utf-8')).hexdigest()[:12]}" if run_identity else ""
+    return f"{safe_name}_{script_hash[:12]}{suffix}"
 
 
 def _read_completed_run(run_dir: Path) -> CompletedRun:
     directory = run_dir.expanduser().resolve()
     if not directory.is_dir():
         raise LibraryError(f"回测运行目录不存在：{directory}")
+    snapshot = directory / "factor_snapshot.py"
+    if not snapshot.is_file():
+        snapshot = directory / "strategy_snapshot.py"
     required = {
         "run_spec.json": directory / "run_spec.json",
         "metrics.json": directory / "metrics.json",
-        "factor_snapshot.py": directory / "factor_snapshot.py",
         "report.html": directory / "report.html",
     }
     missing = [name for name, path in required.items() if not path.is_file()]
     if missing:
         raise LibraryError(f"运行目录不是完整的成功回测，缺少：{', '.join(missing)}")
-    if not ((directory / "returns.csv").exists() or (directory / "research_panel.csv").exists()):
+    if not snapshot.is_file():
+        missing.append("factor_snapshot.py 或 strategy_snapshot.py")
+    if missing:
+        raise LibraryError(f"运行目录不是完整的成功回测，缺少：{', '.join(missing)}")
+    if not ((directory / "returns.csv").exists() or (directory / "research_panel.csv").exists() or (directory / "factor_panel.csv").exists()):
         raise LibraryError("运行目录缺少策略或因子研究结果，不能作为批准证据")
     try:
         run_spec = json.loads(required["run_spec.json"].read_text(encoding="utf-8"))
-        spec = RunSpec.model_validate(run_spec)
         metrics = json.loads(required["metrics.json"].read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, ValueError) as exc:
         raise LibraryError(f"运行目录中的配置或指标无效：{exc}") from exc
     if not isinstance(metrics, dict):
         raise LibraryError("运行目录中的 metrics.json 必须是对象")
+    run_kind = str(run_spec.get("run_kind", "legacy")) if isinstance(run_spec, dict) else "legacy"
+    if run_kind in {"factor", "strategy"}:
+        name = str(run_spec.get("name") or directory.name)
+        normalized_spec = json.dumps(run_spec, ensure_ascii=False, indent=2)
+    else:
+        try:
+            spec = RunSpec.model_validate(run_spec)
+        except ValueError as exc:
+            raise LibraryError(f"历史 YAML 运行记录无效：{exc}") from exc
+        name = spec.name
+        normalized_spec = json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, indent=2)
     return CompletedRun(
         directory=directory,
-        name=spec.name,
-        script_path=required["factor_snapshot.py"],
-        script_hash=hashlib.sha256(required["factor_snapshot.py"].read_bytes()).hexdigest(),
-        run_spec_json=json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, indent=2),
+        name=name,
+        script_path=snapshot,
+        script_hash=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+        run_spec_json=normalized_spec,
         metrics_json=json.dumps(metrics, ensure_ascii=False, indent=2),
+        run_kind=run_kind,
     )
 
 
@@ -153,14 +179,21 @@ def _create_candidate(
     report_source: Path | None,
     run_source: Path | None,
     library_root: Path,
+    idempotent: bool = False,
 ) -> dict[str, str]:
     script_hash = hashlib.sha256(script_content).hexdigest()
     config_hash = hashlib.sha256(run_spec_json.encode("utf-8")).hexdigest()
-    factor_id = _factor_id(name, script_hash)
+    factor_id = _factor_id(name, script_hash, source_run)
     artifact = library_root / "artifacts" / factor_id
     connection = _connection(library_root)
     try:
         if connection.execute("SELECT 1 FROM factors WHERE factor_id = ?", (factor_id,)).fetchone():
+            if idempotent:
+                return {
+                    "factor_id": factor_id,
+                    "artifact_path": str(artifact),
+                    "status": "candidate",
+                }
             raise LibraryError(f"同一因子快照已在因子库中：{factor_id}")
         if artifact.exists():
             raise LibraryError(f"因子库工件目录已存在：{artifact}")
@@ -186,7 +219,7 @@ def _create_candidate(
                     "source_run": source_run or None,
                     "script_hash": script_hash,
                     "config_hash": config_hash,
-                    "has_reproducible_evidence": False,
+                    "has_reproducible_evidence": run_source is not None,
                 },
             )
             connection.execute(
@@ -207,19 +240,39 @@ def _create_candidate(
     return {"factor_id": factor_id, "artifact_path": str(artifact), "status": "candidate"}
 
 
-def create_candidate_from_run(run_dir: Path, library_root: Path) -> dict[str, str]:
+def create_candidate_from_run(
+    run_dir: Path,
+    library_root: Path,
+    *,
+    source_type: str = "completed_run",
+    idempotent: bool = True,
+) -> dict[str, str]:
     """从完整运行快照创建待人工审核的候选因子。"""
     run = _read_completed_run(run_dir)
     return _create_candidate(
         name=run.name,
         script_content=run.script_path.read_bytes(),
         run_spec_json=run.run_spec_json,
-        source_type="completed_run",
+        source_type=source_type,
         source_run=str(run.directory),
         metrics_json=run.metrics_json,
         report_source=run.directory / "report.html",
         run_source=run.directory,
         library_root=library_root,
+        idempotent=idempotent,
+    )
+
+
+def register_completed_run(run_dir: Path, library_root: Path | None = None) -> dict[str, str]:
+    """将一条完整成功运行自动登记到核心候选审核区；对同一运行幂等。"""
+    run = _read_completed_run(run_dir)
+    if run.run_kind == "strategy":
+        raise LibraryError("策略运行不会自动创建因子候选；请在候选审核区手工关联为交易证据")
+    return create_candidate_from_run(
+        run_dir,
+        library_root or default_library_root(),
+        source_type="automatic_run",
+        idempotent=True,
     )
 
 
@@ -233,11 +286,9 @@ def create_candidate_from_upload(
     if Path(factor_name).suffix.lower() != ".py":
         raise LibraryError("候选因子脚本必须是 .py 文件")
     try:
-        payload = yaml.safe_load(config_content.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise LibraryError("候选因子 YAML 根节点必须是对象")
+        payload = load_yaml_mapping(config_content.decode("utf-8"), source="候选因子 YAML")
         spec = RunSpec.model_validate(payload)
-    except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+    except (UnicodeDecodeError, ConfigLoadError, ValueError) as exc:
         raise LibraryError(f"候选因子 YAML 不符合 RunSpec：{exc}") from exc
     run_spec_json = json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, indent=2)
     return _create_candidate(
@@ -296,6 +347,31 @@ def approve_candidate(factor_id: str, evidence_run_dir: Path, library_root: Path
     return {"factor_id": factor_id, "artifact_path": str(artifact), "status": "approved"}
 
 
+def attach_strategy_evidence(factor_id: str, strategy_run_dir: Path, library_root: Path) -> dict[str, str]:
+    """把已完成策略运行作为候选因子的交易证据，不改变候选审批状态。"""
+    run = _read_completed_run(strategy_run_dir)
+    if run.run_kind != "strategy":
+        raise LibraryError("只能关联原生 Python 策略运行作为交易证据")
+    connection = _connection(library_root)
+    try:
+        row = connection.execute("SELECT * FROM factors WHERE factor_id = ?", (factor_id,)).fetchone()
+        if row is None:
+            raise LibraryError(f"未找到候选因子：{factor_id}")
+        artifact = library_root / "artifacts" / factor_id
+        evidence_dir = artifact / "strategy_evidence"
+        _copy_backtest_results(run.directory, evidence_dir)
+        shutil.copy2(run.script_path, evidence_dir / "strategy_snapshot.py")
+        _write_json(
+            evidence_dir / "metadata.json",
+            {"strategy_run": str(run.directory), "strategy_script_hash": run.script_hash, "attached_at": datetime.now(UTC).isoformat()},
+        )
+        connection.execute("UPDATE factors SET strategy_evidence_run = ? WHERE factor_id = ?", (str(run.directory), factor_id))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"factor_id": factor_id, "strategy_run": str(run.directory), "status": "evidence_attached"}
+
+
 def promote(run_dir: Path, library_root: Path) -> dict[str, str]:
     """兼容旧 CLI/MCP：从运行创建候选并以该运行证据立即批准。"""
     candidate = create_candidate_from_run(run_dir, library_root)
@@ -307,7 +383,7 @@ def list_factors(library_root: Path, status: str | None = None) -> list[dict[str
     try:
         query = """
             SELECT factor_id, name, status, created_at, approved_at, source_type, source_run,
-                   evidence_run, script_hash, config_hash
+                   evidence_run, strategy_evidence_run, script_hash, config_hash
             FROM factors
         """
         parameters: tuple[str, ...] = ()

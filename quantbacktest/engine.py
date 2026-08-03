@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,17 @@ from quantbacktest.artifacts import (
     render_research_report,
     write_json,
 )
-from quantbacktest.factors import FactorContext, execute_factor
+from quantbacktest.cuda import CudaExecutionError, create_cuda_factor_context, require_cuda
+from quantbacktest.cuda_research import evaluate_factor_research_cuda
+from quantbacktest.cuda_strategy import (
+    cuda_cross_sectional_positions,
+    cuda_factor_diagnostics,
+    cuda_forward_returns,
+    cuda_simulate_portfolio,
+    cuda_single_asset_positions,
+)
+from quantbacktest.factors import FactorContext, execute_factor, execute_factor_cuda
+from quantbacktest.library import LibraryError, register_completed_run
 from quantbacktest.ml import train_oos_model
 from quantbacktest.research import evaluate_factor_research
 from quantbacktest.schemas import DebugMode, EvaluationMode, RunSpec, StrategyMode
@@ -32,6 +43,8 @@ class RunResult:
     run_dir: Path
     metrics: dict[str, Any]
     warnings: list[str]
+    candidate: dict[str, str] | None = None
+    candidate_registration_error: str | None = None
 
 
 @dataclass
@@ -43,6 +56,131 @@ class SimulationResult:
     cash_bar_ratio: float
     termination_reason: str | None = None
     termination_time: pd.Timestamp | None = None
+
+
+def _write_cuda_failure(
+    output_root: Path, spec: RunSpec, error: CudaExecutionError
+) -> Path:
+    """留下结构化失败工件，避免 CUDA 请求失败后被误判为 CPU 运行。"""
+    run_dir = create_run_dir(output_root, f"{spec.name}_cuda_failed")
+    write_json(run_dir / "run_spec.json", spec.model_dump(mode="json"))
+    write_json(run_dir / "cuda_failure.json", error.as_dict())
+    (run_dir / "report.html").write_text(
+        "<html><meta charset='utf-8'><body><h1>CUDA 回测失败</h1>"
+        f"<p><b>错误代码：</b>{error.code}</p><p><b>原因：</b>{error}</p>"
+        f"<p><b>修复建议：</b>{error.suggestion}</p></body></html>",
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def _completed_run_result(
+    run_dir: Path,
+    metrics: dict[str, Any],
+    warnings: list[str],
+    candidate_library_root: Path | None,
+) -> RunResult:
+    """登记完整运行为候选；登记异常不删除已写入的回测工件。"""
+    try:
+        candidate = register_completed_run(run_dir, candidate_library_root)
+    except (LibraryError, OSError, sqlite3.Error) as exc:
+        message = f"候选登记失败：{exc}"
+        write_json(
+            run_dir / "candidate_registration.json",
+            {"status": "failed", "error": message, "run_dir": str(run_dir)},
+        )
+        return RunResult(run_dir, metrics, warnings, candidate_registration_error=message)
+    write_json(
+        run_dir / "candidate_registration.json",
+        {"status": "registered", "candidate": candidate, "run_dir": str(run_dir)},
+    )
+    return RunResult(run_dir, metrics, warnings, candidate=candidate)
+
+
+def _cuda_simulation_result(
+    frame: pd.DataFrame, positions: pd.DataFrame, spec: RunSpec, device_id: int
+) -> SimulationResult:
+    """Convert a completed CUDA state scan into the existing labelled artifacts."""
+    result = cuda_simulate_portfolio(frame, positions, spec, device_id)
+    timestamps = result["timestamps"]
+    symbols = result["symbols"]
+    valid = result["valid"]
+    returns = pd.Series(result["returns"][valid], index=timestamps[valid], name="strategy_return")
+    weights = result["weights"]
+    reasons = {1: "rebalance", 2: "holding_period_exit", 3: "drawdown_stop"}
+    trade_rows: list[dict[str, Any]] = []
+    for time_index, timestamp in enumerate(timestamps):
+        reason = reasons.get(int(result["reasons"][time_index]))
+        if reason is None:
+            continue
+        previous = weights[time_index - 1] if time_index else np.zeros(len(symbols))
+        current = weights[time_index]
+        changes = current - previous
+        for symbol_index, change in enumerate(changes):
+            if not change:
+                continue
+            turnover = abs(float(change))
+            execution = frame.loc[
+                (frame["timestamp"] == timestamp) & (frame["symbol"] == symbols[symbol_index]), "open"
+            ].iloc[0]
+            trade_rows.append(
+                {
+                    "timestamp": timestamp,
+                    "symbol": symbols[symbol_index],
+                    "previous_weight": float(previous[symbol_index]),
+                    "target_weight": float(current[symbol_index]),
+                    "execution_price": float(execution),
+                    "turnover": turnover,
+                    "cost": turnover * (spec.costs.fee_bps + spec.costs.slippage_bps) / 10_000,
+                    "reason": reason,
+                }
+            )
+    trades = pd.DataFrame(
+        trade_rows,
+        columns=["timestamp", "symbol", "previous_weight", "target_weight", "execution_price", "turnover", "cost", "reason"],
+    )
+    risk_rows: list[dict[str, Any]] = []
+    trigger_indices = np.flatnonzero(result["trigger"])
+    rebalance_indices = np.flatnonzero(result["reasons"] == 1)
+    for trigger_index in trigger_indices:
+        liquidation_candidates = np.flatnonzero((result["liquidation"] == 1) & (np.arange(len(timestamps)) > trigger_index))
+        liquidation_index = int(liquidation_candidates[0]) if len(liquidation_candidates) else None
+        reentry_candidates = rebalance_indices[rebalance_indices > (liquidation_index if liquidation_index is not None else trigger_index)]
+        risk_rows.append(
+            {
+                "trigger_time": timestamps[trigger_index],
+                "liquidation_time": timestamps[liquidation_index] if liquidation_index is not None else None,
+                "trigger_drawdown": float(result["trigger_drawdown"][trigger_index]),
+                "peak_equity": float(result["trigger_peak"][trigger_index]),
+                "trigger_equity": float(result["trigger_equity"][trigger_index]),
+                "liquidation_cost": float(result["costs"][liquidation_index]) if liquidation_index is not None else None,
+                "liquidation_equity": float(result["liquidation_equity"][liquidation_index]) if liquidation_index is not None else None,
+                "reentry_time": timestamps[int(reentry_candidates[0])] if len(reentry_candidates) else None,
+            }
+        )
+    risk_events = pd.DataFrame(
+        risk_rows,
+        columns=["trigger_time", "liquidation_time", "trigger_drawdown", "peak_equity", "trigger_equity", "liquidation_cost", "liquidation_equity", "reentry_time"],
+    )
+    terminated = np.flatnonzero(~valid)
+    termination_time = timestamps[int(terminated[0])] if len(terminated) else None
+    termination_reason = (
+        "组合净值降至零或以下；CUDA 状态机已停止合成收益模拟，后续账户年化指标无经济解释"
+        if termination_time is not None
+        else None
+    )
+    positions = positions.copy()
+    positions["turnover"] = 0.0
+    positions["cost"] = 0.0
+    return SimulationResult(
+        returns=returns,
+        positions=positions,
+        trades=trades,
+        risk_events=risk_events,
+        cash_bar_ratio=float((result["reasons"] == 3).sum() / len(timestamps)),
+        termination_reason=termination_reason,
+        termination_time=termination_time,
+    )
 
 
 def _forward_returns(frame: pd.DataFrame, holding_bars: int) -> pd.DataFrame:
@@ -74,14 +212,19 @@ def _cross_sectional_positions(frame: pd.DataFrame, spec: RunSpec) -> pd.DataFra
             n = max(1, len(selected) // (strategy.quantiles or 2))
             long_index = selected.tail(n).index
             short_index = selected.head(n).index
+        side_gross_exposure = strategy.gross_exposure / (2 if strategy.long_short == "market_neutral" else 1)
         if strategy.weighting == "score":
             long_values = selected.loc[long_index, "factor"].abs()
-            long_weights = long_values / long_values.sum() if long_values.sum() else pd.Series(1 / len(long_index), index=long_index)
+            long_weights = (
+                long_values / long_values.sum() * side_gross_exposure
+                if long_values.sum()
+                else pd.Series(side_gross_exposure / len(long_index), index=long_index)
+            )
         else:
-            long_weights = pd.Series(1 / len(long_index), index=long_index)
+            long_weights = pd.Series(side_gross_exposure / len(long_index), index=long_index)
         active.loc[long_index, "target_weight"] = long_weights.clip(upper=strategy.max_weight)
         if strategy.long_short == "market_neutral":
-            active.loc[short_index, "target_weight"] = -1 / len(short_index)
+            active.loc[short_index, "target_weight"] = -side_gross_exposure / len(short_index)
     return active
 
 
@@ -331,7 +474,11 @@ def _trace(
     return trace
 
 
-def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
+def run_backtest(
+    spec: RunSpec,
+    project_root: Path | None = None,
+    candidate_library_root: Path | None = None,
+) -> RunResult:
     """运行统一的截面或单资产研究，所有工件落在调用项目结果目录。"""
     project_root = project_root or Path.cwd()
     data_spec = spec.data.model_copy(deep=True)
@@ -357,6 +504,23 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
         data = data[data["symbol"].isin(spec.debug.symbols)]
     if data.empty:
         raise ValueError("调试时间窗口或币种过滤后没有可用数据")
+    if spec.compute is not None and spec.compute.backend == "cuda":
+        try:
+            require_cuda(spec.compute.device_id)
+            cuda_context = create_cuda_factor_context(data, spec.factor.parameters, spec.compute.device_id)
+            factor, factor_meta = execute_factor_cuda(factor_path, spec.factor.callable, cuda_context)
+            raise CudaExecutionError(
+                "cuda_pipeline_stage_unsupported",
+                "CUDA 因子已验证，但当前版本尚未完成研究评估与策略执行阶段的 CUDA 实现。",
+                "请暂时使用 compute.backend: cpu；该运行不会被错误标记为 CUDA 回测。",
+            )
+        except CudaExecutionError as exc:
+            failure_dir = _write_cuda_failure(output_root, spec, exc)
+            raise CudaExecutionError(
+                exc.code,
+                str(exc),
+                f"{exc.suggestion} 详细诊断与 HTML 报告已写入：{failure_dir}",
+            ) from exc
     factor, factor_meta = execute_factor(factor_path, spec.factor.callable, FactorContext(data, spec.factor.parameters))
     supported_modes = factor_meta["meta"]["supported_modes"]
     is_research = spec.evaluation is not None and spec.evaluation.mode is EvaluationMode.factor_research
@@ -426,7 +590,7 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
             )
         write_json(run_dir / "metrics.json", metrics)
         render_research_report(run_dir / "report.html", research.group_returns, research.spread, metrics, base_meta)
-        return RunResult(run_dir, metrics, warnings)
+        return _completed_run_result(run_dir, metrics, warnings, candidate_library_root)
 
     assert spec.strategy is not None
     frame = _forward_returns(frame, spec.strategy.execution.holding_bars)
@@ -478,4 +642,4 @@ def run_backtest(spec: RunSpec, project_root: Path | None = None) -> RunResult:
         write_json(run_dir / "debug_trace.json", _trace(frame, positions, simulation.trades, simulation.risk_events))
     write_json(run_dir / "metrics.json", metrics)
     render_report(run_dir / "report.html", returns, benchmark, metrics, base_meta, simulation.risk_events)
-    return RunResult(run_dir, metrics, warnings)
+    return _completed_run_result(run_dir, metrics, warnings, candidate_library_root)

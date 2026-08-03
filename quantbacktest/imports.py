@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from quantbacktest.config_io import ConfigLoadError, load_yaml_mapping
 from quantbacktest.schemas import RunSpec
 
 
@@ -41,11 +42,11 @@ def prepare_imported_run(
     if Path(factor_name).suffix.lower() != ".py":
         raise ValueError("因子文件必须是 .py Python 脚本")
     try:
-        payload: Any = yaml.safe_load(config_content.decode("utf-8"))
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        payload: Any = load_yaml_mapping(
+            config_content.decode("utf-8"), source="上传的 YAML 配置"
+        )
+    except (UnicodeDecodeError, ConfigLoadError) as exc:
         raise ValueError(f"无法读取 YAML 配置：{exc}") from exc
-    if not isinstance(payload, dict):
-        raise TypeError("YAML 配置的根节点必须是对象")
 
     data = payload.get("data")
     if not isinstance(data, dict) or not data.get("path"):

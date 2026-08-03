@@ -16,6 +16,7 @@ from quantbacktest.library import (
     list_factors,
     open_html_report,
     promote,
+    register_completed_run,
 )
 
 
@@ -73,6 +74,28 @@ def test_create_candidate_from_completed_run_keeps_preview_evidence(tmp_path: Pa
     assert list_completed_runs(tmp_path) == [
         {"run_dir": str(run_dir.resolve()), "name": "library_case", "script_hash": hashlib.sha256(script).hexdigest()}
     ]
+
+
+def test_automatic_candidates_are_per_run_and_idempotent(tmp_path: Path) -> None:
+    script = b"def compute_factor(context):\n    return context.data\n"
+    first_run = _completed_run(tmp_path, script, "first_run")
+    second_run = _completed_run(tmp_path, script, "second_run")
+    library_root = tmp_path / "library"
+
+    first = register_completed_run(first_run, library_root)
+    repeated = register_completed_run(first_run, library_root)
+    second = register_completed_run(second_run, library_root)
+
+    assert first["factor_id"] == repeated["factor_id"]
+    assert first["factor_id"] != second["factor_id"]
+    records = list_factors(library_root, status="candidate")
+    assert len(records) == 2
+    assert {record["source_type"] for record in records} == {"automatic_run"}
+    assert {record["source_run"] for record in records} == {
+        str(first_run.resolve()),
+        str(second_run.resolve()),
+    }
+    assert (Path(first["artifact_path"]) / "backtest_results" / "returns.csv").exists()
 
 
 def test_direct_upload_candidate_is_not_executed_or_given_metrics(tmp_path: Path) -> None:

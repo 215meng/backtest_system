@@ -3,8 +3,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from quantbacktest.analytics import performance_metrics
-from quantbacktest.engine import _forward_returns, _simulate_portfolio, run_backtest
+from quantbacktest.analytics import equal_weight_benchmark, performance_metrics
+from quantbacktest.engine import (
+    _cross_sectional_positions,
+    _forward_returns,
+    _simulate_portfolio,
+    run_backtest,
+)
 from quantbacktest.schemas import RunSpec
 
 
@@ -21,6 +26,56 @@ def test_forward_returns_use_next_open_and_holding_exit() -> None:
     assert result.loc[0, "entry_open"] == 110.0
     assert result.loc[0, "exit_open"] == 121.0
     assert result.loc[0, "forward_return"] == pytest.approx(0.1)
+
+
+def test_equal_weight_benchmark_uses_one_bar_returns_not_holding_period_returns() -> None:
+    timestamps = pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC")
+    frame = pd.DataFrame(
+        [
+            {"timestamp": timestamp, "symbol": symbol, "close": close, "forward_return": 0.5}
+            for symbol, closes in {"A": [100.0, 110.0, 121.0], "B": [200.0, 220.0, 242.0]}.items()
+            for timestamp, close in zip(timestamps, closes, strict=True)
+        ]
+    )
+
+    benchmark = equal_weight_benchmark(frame)
+
+    assert benchmark.tolist() == pytest.approx([0.0, 0.1, 0.1])
+
+
+def test_factor_mimicking_positions_have_one_times_gross_exposure() -> None:
+    timestamps = pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC")
+    frame = pd.DataFrame(
+        [
+            {"timestamp": timestamp, "symbol": f"S{index}", "open": 100.0, "close": 100.0, "factor": float(index)}
+            for timestamp in timestamps
+            for index in range(12)
+        ]
+    )
+    frame = _forward_returns(frame, holding_bars=1)
+    spec = RunSpec.model_validate(
+        {
+            "name": "minimal_profile",
+            "data": {"adapter": "crypto_top50", "path": "data/raw/crypto", "market": "spot", "frequency": "1h", "symbols": [f"S{index}" for index in range(12)]},
+            "factor": {"module_path": "factor.py"},
+            "strategy": {
+                "profile": "factor_mimicking",
+                "mode": "cross_sectional",
+                "selection": "quantiles",
+                "quantiles": 3,
+                "long_short": "market_neutral",
+                "weighting": "equal",
+                "gross_exposure": 1.0,
+                "rebalance_bars": 1,
+                "execution": {"holding_bars": 1},
+            },
+        }
+    )
+    positions = _cross_sectional_positions(frame, spec)
+    weights = positions.loc[positions["timestamp"] == timestamps[0], "target_weight"]
+    assert weights[weights > 0].sum() == pytest.approx(0.5)
+    assert weights[weights < 0].sum() == pytest.approx(-0.5)
+    assert weights.abs().sum() == pytest.approx(1.0)
 
 
 def test_trace_backtest_writes_artifacts(tmp_path: Path) -> None:
@@ -40,11 +95,39 @@ def test_trace_backtest_writes_artifacts(tmp_path: Path) -> None:
         "debug": {"mode": "trace"},
         "output": {"root": str(tmp_path / "results")},
     }
-    result = run_backtest(RunSpec.model_validate(payload), tmp_path)
+    result = run_backtest(
+        RunSpec.model_validate(payload), tmp_path, candidate_library_root=tmp_path / "library"
+    )
     assert (result.run_dir / "report.html").exists()
     assert (result.run_dir / "debug_trace.json").exists()
     assert (result.run_dir / "risk_events.csv").exists()
     assert "risk_control" in (result.run_dir / "debug_trace.json").read_text(encoding="utf-8")
+    assert result.candidate is not None
+    assert result.candidate_registration_error is None
+    assert (tmp_path / "library" / "artifacts" / result.candidate["factor_id"]).is_dir()
+
+    dry_run_payload = {**payload, "name": "dry_run_case", "debug": {"mode": "dry_run"}}
+    dry_run = run_backtest(
+        RunSpec.model_validate(dry_run_payload),
+        tmp_path,
+        candidate_library_root=tmp_path / "dry_run_library",
+    )
+    assert dry_run.candidate is None
+    assert dry_run.candidate_registration_error is None
+    assert not (tmp_path / "dry_run_library").exists()
+
+    blocked_library = tmp_path / "blocked_library"
+    blocked_library.write_text("not a directory", encoding="utf-8")
+    failure_payload = {**payload, "name": "candidate_failure_case"}
+    registration_failure = run_backtest(
+        RunSpec.model_validate(failure_payload),
+        tmp_path,
+        candidate_library_root=blocked_library,
+    )
+    assert registration_failure.candidate is None
+    assert registration_failure.candidate_registration_error is not None
+    assert (registration_failure.run_dir / "report.html").exists()
+    assert (registration_failure.run_dir / "candidate_registration.json").exists()
 
 
 def test_factor_research_writes_statistical_artifacts_without_account_metrics(tmp_path: Path) -> None:
@@ -98,7 +181,9 @@ def test_factor_research_writes_statistical_artifacts_without_account_metrics(tm
         "ml": {"enabled": True, "model": "lightgbm", "parameters": {"n_estimators": 5}},
         "output": {"root": str(tmp_path / "results")},
     }
-    result = run_backtest(RunSpec.model_validate(payload), tmp_path)
+    result = run_backtest(
+        RunSpec.model_validate(payload), tmp_path, candidate_library_root=tmp_path / "library"
+    )
     assert result.metrics["evaluation_mode"] == "factor_research"
     assert "annual_return" not in result.metrics
     assert (result.run_dir / "report.html").exists()
@@ -106,6 +191,7 @@ def test_factor_research_writes_statistical_artifacts_without_account_metrics(tm
     assert (result.run_dir / "research_contributions.csv").exists()
     assert (result.run_dir / "model.pkl").exists()
     assert not (result.run_dir / "returns.csv").exists()
+    assert result.candidate is not None
 
 
 def test_drawdown_stop_liquidates_next_open_and_reenters_next_rebalance() -> None:

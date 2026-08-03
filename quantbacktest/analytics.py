@@ -58,7 +58,15 @@ def factor_diagnostics(frame: pd.DataFrame) -> dict[str, object]:
 
 
 def equal_weight_benchmark(frame: pd.DataFrame) -> pd.Series:
-    return frame.groupby("timestamp")["forward_return"].mean().rename("benchmark_return")
+    """Return the one-bar equal-weight close-to-close market benchmark.
+
+    ``forward_return`` can span a strategy holding period and therefore must never be
+    compounded at the base bar frequency.  A report benchmark is instead calculated
+    from each asset's adjacent close-to-close return.
+    """
+    ordered = frame.sort_values(["symbol", "timestamp"])
+    one_bar_returns = ordered.groupby("symbol", group_keys=False)["close"].pct_change()
+    return one_bar_returns.groupby(ordered["timestamp"]).mean().fillna(0.0).rename("benchmark_return")
 
 
 def quantile_returns(frame: pd.DataFrame, quantiles: int) -> pd.DataFrame:

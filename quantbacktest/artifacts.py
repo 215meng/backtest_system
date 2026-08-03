@@ -119,3 +119,83 @@ def render_research_report(
         "</body></html>",
         encoding="utf-8",
     )
+
+
+def _finite_series(series: pd.Series) -> pd.Series:
+    """图表只接受有限数值，避免异常值把所有曲线压成直线。"""
+    values = pd.to_numeric(series, errors="coerce")
+    return values.where(values.map(lambda item: pd.notna(item) and float("-inf") < item < float("inf")))
+
+
+def render_native_factor_report(
+    path: Path,
+    groups: pd.DataFrame,
+    cumulative: pd.DataFrame,
+    long_short: pd.DataFrame,
+    metrics: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    figure = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        subplot_titles=("各分组前瞻收益", "Group Cumulative Returns", "Top-Bottom 多空收益（成本后）"),
+    )
+    if not groups.empty:
+        for group_id, item in groups.groupby("group", sort=True):
+            figure.add_trace(
+                go.Scatter(x=item["timestamp"], y=_finite_series(item["return"]), name=f"G{group_id}"),
+                row=1,
+                col=1,
+            )
+    if not cumulative.empty:
+        for column in cumulative.columns:
+            figure.add_trace(
+                go.Scatter(x=cumulative.index, y=_finite_series(cumulative[column]), name=f"G{column} 累计"),
+                row=2,
+                col=1,
+            )
+    if not long_short.empty:
+        figure.add_trace(
+            go.Scatter(x=long_short["timestamp"], y=(1 + _finite_series(long_short["net_return"])).cumprod(), name="多空净值"),
+            row=3,
+            col=1,
+        )
+    figure.update_layout(title=manifest.get("name", "原生 Python 因子报告"), template="plotly_white", height=980)
+    scalar_metrics = "".join(f"<li><b>{key}</b>: {value}</li>" for key, value in metrics.items() if not isinstance(value, (dict, list)))
+    path.write_text(
+        "<html><meta charset='utf-8'><body>"
+        f"<h1>{manifest.get('name', '原生 Python 因子报告')}</h1>"
+        "<p>该报告由原始因子表产生；分组、前瞻收益与成本口径均来自脚本的 set_factor_evaluation 声明。</p>"
+        f"<h2>指标</h2><ul>{scalar_metrics}</ul>{figure.to_html(full_html=False, include_plotlyjs=True)}"
+        "</body></html>",
+        encoding="utf-8",
+    )
+
+
+def render_native_strategy_report(
+    path: Path,
+    returns: pd.Series,
+    benchmark: pd.Series,
+    equity_events: pd.DataFrame,
+    orders: pd.DataFrame,
+    metrics: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    equity = (1 + _finite_series(returns).fillna(0.0)).cumprod()
+    benchmark_equity = (1 + _finite_series(benchmark.reindex(returns.index)).fillna(0.0)).cumprod()
+    drawdown = equity / equity.cummax() - 1.0
+    figure = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=("策略净值", "基准净值", "回撤"))
+    figure.add_trace(go.Scatter(x=equity.index, y=equity, name="策略净值"), row=1, col=1)
+    figure.add_trace(go.Scatter(x=benchmark_equity.index, y=benchmark_equity, name="基准净值"), row=2, col=1)
+    figure.add_trace(go.Scatter(x=drawdown.index, y=drawdown, name="回撤", fill="tozeroy"), row=3, col=1)
+    figure.update_layout(title=manifest.get("name", "原生 Python 策略报告"), template="plotly_white", height=980)
+    scalar_metrics = "".join(f"<li><b>{key}</b>: {value}</li>" for key, value in metrics.items() if not isinstance(value, (dict, list)))
+    orders_html = orders.to_html(index=False, border=0) if not orders.empty else "<p>本次没有订单。</p>"
+    path.write_text(
+        "<html><meta charset='utf-8'><body>"
+        f"<h1>{manifest.get('name', '原生 Python 策略报告')}</h1><h2>策略指标</h2><ul>{scalar_metrics}</ul>"
+        f"{figure.to_html(full_html=False, include_plotlyjs=True)}<h2>订单、成交与拒单</h2>{orders_html}"
+        "</body></html>",
+        encoding="utf-8",
+    )

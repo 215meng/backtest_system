@@ -1,21 +1,26 @@
 # QuantBacktest
 
-本项目是面向加密货币论文因子复现的本机回测系统。它统一提供 Python API、CLI、Streamlit Web 与 MCP 调用入口，并将每次运行保存为可审计的结果目录。
+QuantBacktest 是本地加密数据的原生 Python 因子与事件策略回测平台。用户只维护 Python 文件；平台提供数据、严格历史时点约束、因子评价、交易仿真、运行工件和候选审核。
+
+```text
+因子 Python → IC / 分组 / 多空绩效 → 自动候选
+策略 Python → 回调 / 订单 / 净值绩效 → 手工关联为交易证据
+```
 
 ## 快速开始
 
 ```powershell
 conda activate backtest-system
 pip install -e .[dev]
-quantbacktest validate examples/cross_sectional.yaml
-quantbacktest run examples/cross_sectional.yaml
-streamlit run quantbacktest/web.py
+quantbacktest factor-validate examples\native_binance_smoke_factor.py
+quantbacktest factor-run examples\native_binance_smoke_factor.py
+quantbacktest strategy-validate examples\native_crypto_smoke_strategy.py
+quantbacktest strategy-run examples\native_crypto_smoke_strategy.py
+streamlit run quantbacktest\web.py
 ```
 
-调用前先运行 `quantbacktest schema` 或 MCP 的 `validate_run_spec`。完整输入由 Pydantic JSON Schema 定义；未知字段会被拒绝，条件字段会给出业务化错误。
+新运行不需要 YAML。因子脚本使用 `initialize(context)` 声明数据和评价口径，并由 `main(context)` 返回 `timestamp`、`symbol`、`factor`；策略脚本使用 `initialize(context)` 声明账户和调度，在回调中调用历史数据与下单 API。
 
-## 外部因子约定
+外部项目请通过 MCP 的 `create_factor_script` / `create_strategy_script` 生成骨架，再调用相应 `validate_*_script` 与运行工具。详细契约见 [跨项目调用指南](docs/跨项目调用指南.md)。
 
-外部脚本需定义 `FactorMeta` 和 `compute_factor(context)`。`context.data` 是标准长表，包含 `timestamp`、`symbol`、`open`、`high`、`low`、`close`、`volume` 与 `turnover`（可用时）。函数返回带 `timestamp`、`symbol`、`factor` 的表，或相同索引的 `Series`。
-
-所有外部脚本均视作本地可信代码。回测系统会检查其输入输出与数据覆盖，不会把独立进程当作安全沙箱。
+本项目执行外部 Python 脚本时将其视为本地可信代码，不把独立进程当作安全沙箱。历史 YAML 运行目录仅保留审计用途，不能作为新的公开运行入口。

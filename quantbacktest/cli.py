@@ -1,59 +1,91 @@
+"""原生 Python 回测命令行入口；YAML 仅保留为历史工件。"""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 import typer
-import yaml
 
 from quantbacktest.adapters import available_assets
-from quantbacktest.engine import run_backtest
-from quantbacktest.factors import inspect_factor
-from quantbacktest.library import list_factors, promote
-from quantbacktest.schemas import RunSpec
+from quantbacktest.library import attach_strategy_evidence, default_library_root, list_factors
+from quantbacktest.native import (
+    DownloadManifestError,
+    run_factor_script,
+    run_strategy_script,
+    validate_factor_script,
+    validate_strategy_script,
+)
 
-app = typer.Typer(no_args_is_help=True, help="加密货币因子研究与回测")
-
-
-def _spec(path: Path) -> RunSpec:
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return RunSpec.model_validate(payload)
-
-
-@app.command("schema")
-def schema() -> None:
-    """打印 Codex/MCP 可使用的 JSON Schema。"""
-    typer.echo(json.dumps(RunSpec.model_json_schema(), ensure_ascii=False, indent=2))
+app = typer.Typer(no_args_is_help=True, help="QuantBacktest 原生 Python 因子与策略回测平台")
+DEFAULT_PROJECT_ROOT = Path.cwd()
+DEFAULT_LIBRARY_ROOT = default_library_root()
 
 
-@app.command("validate")
-def validate(path: Path) -> None:
-    """验证配置，不计算因子或生成交易。"""
-    spec = _spec(path)
-    typer.echo(json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, indent=2, default=str))
+def _emit(value: object) -> None:
+    typer.echo(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _run_payload(result: object) -> dict[str, object]:
+    return {
+        "status": "candidate_registration_failed" if result.candidate_registration_error else "completed",
+        "run_kind": result.run_kind,
+        "run_dir": str(result.run_dir),
+        "metrics": result.metrics,
+        "candidate": result.candidate,
+        "candidate_registration_error": result.candidate_registration_error,
+    }
 
 
 @app.command("assets")
 def assets(adapter: str, path: Path) -> None:
-    typer.echo(json.dumps(available_assets(adapter, path), ensure_ascii=False, indent=2))
+    """列出本地适配器可用交易对与标准字段。"""
+    _emit(available_assets(adapter, path))
 
 
-@app.command("inspect-factor")
-def inspect_factor_command(path: Path) -> None:
-    typer.echo(json.dumps(inspect_factor(path), ensure_ascii=False, indent=2))
+@app.command("factor-validate")
+def factor_validate(script: Path, project_root: Path = DEFAULT_PROJECT_ROOT) -> None:
+    """校验原生 Python 因子脚本及其本地数据能力，不创建运行。"""
+    try:
+        _emit(validate_factor_script(script, project_root))
+    except DownloadManifestError as exc:
+        _emit({"valid": False, "error": str(exc), "download_manifest": exc.manifest})
+        raise typer.Exit(code=1) from exc
 
 
-@app.command("run")
-def run(path: Path) -> None:
-    result = run_backtest(_spec(path), Path.cwd())
-    typer.echo(json.dumps({"run_dir": str(result.run_dir), "metrics": result.metrics}, ensure_ascii=False, indent=2, default=str))
+@app.command("strategy-validate")
+def strategy_validate(script: Path, project_root: Path = DEFAULT_PROJECT_ROOT) -> None:
+    """校验原生 Python 事件策略及其交易能力，不创建运行。"""
+    try:
+        _emit(validate_strategy_script(script, project_root))
+    except DownloadManifestError as exc:
+        _emit({"valid": False, "error": str(exc), "download_manifest": exc.manifest})
+        raise typer.Exit(code=1) from exc
 
 
-@app.command("promote")
-def promote_command(run_dir: Path, library_root: Path = Path("factor_library")) -> None:
-    typer.echo(json.dumps(promote(run_dir, library_root), ensure_ascii=False, indent=2))
+@app.command("factor-run")
+def factor_run(script: Path, project_root: Path = DEFAULT_PROJECT_ROOT) -> None:
+    """运行一个原生 Python 因子，并自动登记候选。"""
+    _emit(_run_payload(run_factor_script(script, project_root)))
+
+
+@app.command("strategy-run")
+def strategy_run(script: Path, project_root: Path = DEFAULT_PROJECT_ROOT) -> None:
+    """运行一个原生 Python 事件策略；策略不会自动成为因子候选。"""
+    _emit(_run_payload(run_strategy_script(script, project_root)))
+
+
+@app.command("attach-strategy-evidence")
+def attach_strategy_evidence_command(
+    factor_id: str,
+    strategy_run_dir: Path,
+    library_root: Path = DEFAULT_LIBRARY_ROOT,
+) -> None:
+    """手工把策略运行关联为某个因子候选的交易证据。"""
+    _emit(attach_strategy_evidence(factor_id, strategy_run_dir, library_root))
 
 
 @app.command("library")
-def library_command(library_root: Path = Path("factor_library")) -> None:
-    typer.echo(json.dumps(list_factors(library_root), ensure_ascii=False, indent=2))
+def library_command(library_root: Path = DEFAULT_LIBRARY_ROOT) -> None:
+    """查看候选审核区；批准动作仍需在 Web 界面人工完成。"""
+    _emit(list_factors(library_root))

@@ -94,8 +94,15 @@ def _load_binance_zip(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
             with zipfile.ZipFile(path) as archive:
                 member = archive.namelist()[0]
                 with archive.open(member) as handle:
-                    raw = pd.read_csv(handle, names=RAW_COLUMNS)
-            raw["timestamp"] = pd.to_datetime(raw["open_time_ms"], unit="ms", utc=True)
+                    raw = pd.read_csv(handle, names=RAW_COLUMNS, header=None)
+            # Binance 压缩包既可能无表头，也可能带表头；表头若被当作数据会被
+            # pandas 误解析成远未来时间，必须先将毫秒时间戳强制转为数值。
+            raw["open_time_ms"] = pd.to_numeric(raw["open_time_ms"], errors="coerce")
+            raw = raw.dropna(subset=["open_time_ms"])
+            # 历史归档中同时存在毫秒和微秒时间戳；按数量级识别，避免把微秒
+            # 误当毫秒而生成数万年后的伪造样本。
+            unit = "us" if raw["open_time_ms"].median() >= 100_000_000_000_000 else "ms"
+            raw["timestamp"] = pd.to_datetime(raw["open_time_ms"], unit=unit, utc=True)
             frames.append(_canonicalize(raw, symbol))
             paths.append(path)
     return pd.concat(frames, ignore_index=True), paths

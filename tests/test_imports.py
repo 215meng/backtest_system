@@ -41,3 +41,34 @@ def test_prepare_imported_run_snapshots_factor_and_resolves_paths(tmp_path: Path
     assert prepared.spec.data.start.isoformat().startswith("2024-01-01T00:00:00")
     assert prepared.spec.data.end.isoformat().startswith("2024-01-31T23:59:59")
     assert "external_factor.py" in prepared.normalized_yaml
+
+
+def test_prepare_imported_run_accepts_unquoted_off_as_yaml12_string(tmp_path: Path) -> None:
+    source_root = tmp_path / "factor_project"
+    source_root.mkdir()
+    config = b'''name: import_case
+data:
+  adapter: crypto_top50
+  path: data/raw/crypto
+  market: spot
+  frequency: 1h
+  symbols: [S0, S1, S2, S3, S4, S5, S6, S7, S8, S9]
+factor: {}
+strategy:
+  mode: cross_sectional
+  selection: quantiles
+  long_short: long_only
+  quantiles: 2
+debug:
+  mode: off
+'''
+    factor = b"FactorMeta={'required_fields':['close'], 'min_lookback_bars':1, 'supported_modes':['cross_sectional']}\ndef compute_factor(context):\n return context.data[['timestamp', 'symbol']].assign(factor=1.0)\n"
+
+    prepared = prepare_imported_run(
+        factor_name="external_factor.py",
+        factor_content=factor,
+        config_content=config,
+        source_root=source_root,
+    )
+
+    assert prepared.spec.debug.mode.value == "off"

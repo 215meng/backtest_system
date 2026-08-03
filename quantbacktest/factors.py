@@ -9,6 +9,8 @@ from typing import Any
 
 import pandas as pd
 
+from quantbacktest.cuda import CudaExecutionError, CudaFactorContext, cuda_factor_output
+
 
 @dataclass(frozen=True)
 class FactorContext:
@@ -44,6 +46,38 @@ def inspect_factor(path: Path) -> dict[str, Any]:
     if missing:
         raise FactorContractError(f"FactorMeta 缺少字段：{sorted(missing)}")
     return meta
+
+
+def execute_factor_cuda(
+    path: Path, callable_name: str, context: CudaFactorContext
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """执行明确声明的 GPU 因子；不允许回退到 compute_factor。"""
+    module = load_factor_module(path)
+    meta = inspect_factor(path)
+    supported_backends = meta.get("supported_backends", [])
+    if "cuda" not in supported_backends:
+        raise CudaExecutionError(
+            "cuda_factor_not_declared",
+            f"因子脚本未声明 CUDA 支持：{path}",
+            '在 FactorMeta 中添加 supported_backends: ["cuda"]，并实现 compute_factor_cuda(context)。',
+        )
+    cuda_callable = f"{callable_name}_cuda"
+    function = getattr(module, cuda_callable, None)
+    if not callable(function):
+        raise CudaExecutionError(
+            "cuda_factor_callable_missing",
+            f"因子脚本缺少 {cuda_callable}(context)",
+            "实现该函数并返回与输入行一一对应的一维 CuPy 因子数组。",
+        )
+    output = cuda_factor_output(function(context), context)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return output, {
+        "meta": meta,
+        "factor_fingerprint": digest,
+        "module_path": str(path.resolve()),
+        "backend": "cuda",
+        "callable": cuda_callable,
+    }
 
 
 def execute_factor(path: Path, callable_name: str, context: FactorContext) -> tuple[pd.DataFrame, dict[str, Any]]:

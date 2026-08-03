@@ -19,6 +19,8 @@ dependencies = [
   "scikit-learn>=1.4",
   "lightgbm>=4.0",
   "xgboost>=2.0",
+  "cupy-cuda12x>=14.1",
+  "numba>=0.66",
   "mcp>=1.0",
 ]
 

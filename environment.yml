@@ -6,4 +6,6 @@ dependencies:
   - python=3.11
   - pip
   - pip:
+      - cupy-cuda12x>=14.1
+      - numba>=0.66
       - -e .[dev]

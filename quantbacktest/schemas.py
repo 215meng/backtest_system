@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -87,6 +87,7 @@ class RiskControlSpec(StrictModel):
 
 
 class StrategySpec(StrictModel):
+    profile: Literal["factor_mimicking"] | None = None
     mode: StrategyMode
     execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     rebalance_bars: int = Field(default=1, ge=1)
@@ -96,6 +97,7 @@ class StrategySpec(StrictModel):
     top_k: int | None = Field(default=None, ge=1)
     weighting: Literal["equal", "score"] = "equal"
     max_weight: float = Field(default=1.0, gt=0, le=1.0)
+    gross_exposure: float = Field(default=2.0, gt=0, le=2.0)
     symbol: str | None = None
     signal_rule: SignalRule | None = None
     hook_callable: str | None = None
@@ -113,6 +115,19 @@ class StrategySpec(StrictModel):
         else:
             if self.symbol is None or self.signal_rule is None:
                 raise ValueError("单资产模式必须提供 symbol 与 signal_rule")
+        if self.profile == "factor_mimicking":
+            if self.mode is not StrategyMode.cross_sectional:
+                raise ValueError("factor_mimicking only supports cross-sectional strategies")
+            if self.selection != "quantiles" or self.quantiles != 3:
+                raise ValueError("factor_mimicking requires tercile selection")
+            if self.long_short != "market_neutral" or self.weighting != "equal":
+                raise ValueError("factor_mimicking requires equal-weight market neutrality")
+            if self.gross_exposure != 1.0:
+                raise ValueError("factor_mimicking requires gross_exposure: 1.0")
+            if self.rebalance_bars != self.execution.holding_bars:
+                raise ValueError("factor_mimicking requires rebalance_bars to equal holding_bars")
+            if self.risk_control.max_drawdown_stop.enabled:
+                raise ValueError("factor_mimicking disables stop-losses to isolate factor performance")
         return self
 
 
@@ -189,6 +204,13 @@ class BenchmarkSpec(StrictModel):
     type: Literal["equal_weight_universe"] = "equal_weight_universe"
 
 
+class ComputeSpec(StrictModel):
+    backend: Literal["cuda", "cpu"] = "cuda"
+    device_id: int = Field(default=0, ge=0)
+    on_unavailable: Literal["error", "cpu_explicit"] = "error"
+    profile: bool = True
+
+
 class MLSpec(StrictModel):
     enabled: bool = False
     model: Literal["lightgbm", "xgboost"] | None = None
@@ -209,6 +231,16 @@ class DebugSpec(StrictModel):
         default_factory=lambda: ["data", "factor", "signal", "portfolio", "execution"]
     )
 
+    @field_validator("mode", mode="before")
+    @classmethod
+    def reject_boolean_mode(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError(  # noqa: TRY004 - Pydantic must convert this into a ValidationError.
+                'debug.mode 必须是字符串；YAML 请写 mode: "off"，MCP JSON 请写 '
+                '{"mode": "off"}。如无需调试，可省略整个 debug 块。'
+            )
+        return value
+
 
 class OutputSpec(StrictModel):
     root: Path = Path("results/backtests")
@@ -221,6 +253,25 @@ class ProvenanceSpec(StrictModel):
     proxy_data_note: str | None = None
 
 
+class PaperBacktestRequest(StrictModel):
+    """外部论文复现提交给 MCP 的能力评估声明。"""
+
+    paper_title: str = Field(min_length=1)
+    paper_reference: str | None = None
+    data_source: str | None = None
+    adapter: str = Field(min_length=1)
+    market: str = Field(min_length=1)
+    frequency: str = Field(min_length=1)
+    asset_universe_note: str | None = None
+    factor_inputs: list[str] = Field(default_factory=list)
+    universe_features: list[str] = Field(default_factory=list)
+    formation_features: list[str] = Field(default_factory=list)
+    portfolio_features: list[str] = Field(default_factory=list)
+    execution_features: list[str] = Field(default_factory=list)
+    research_features: list[str] = Field(default_factory=list)
+    run_kind: Literal["minimal_factor_strategy"] = "minimal_factor_strategy"
+
+
 class RunSpec(StrictModel):
     name: str = Field(min_length=1)
     data: DataSpec
@@ -229,6 +280,7 @@ class RunSpec(StrictModel):
     evaluation: EvaluationSpec | None = None
     costs: CostSpec = Field(default_factory=CostSpec)
     benchmark: BenchmarkSpec = Field(default_factory=BenchmarkSpec)
+    compute: ComputeSpec | None = None
     ml: MLSpec = Field(default_factory=MLSpec)
     debug: DebugSpec = Field(default_factory=DebugSpec)
     output: OutputSpec = Field(default_factory=OutputSpec)
@@ -242,6 +294,11 @@ class RunSpec(StrictModel):
         if is_research:
             return self
         assert self.strategy is not None
+        if self.strategy.profile == "factor_mimicking":
+            if self.costs.fee_bps != 0 or self.costs.slippage_bps != 0 or self.costs.funding_bps_per_bar not in (None, 0):
+                raise ValueError("factor_mimicking requires zero fees, slippage, and funding")
+            if self.ml.enabled:
+                raise ValueError("factor_mimicking disables ML to isolate factor performance")
         if self.strategy.mode is StrategyMode.cross_sectional:
             universe = self.data.universe or UniverseSpec()
             if len(self.data.symbols) < universe.min_assets:
