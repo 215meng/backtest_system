@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from quantbacktest.schemas import DataSpec
+from quantbacktest.api import DataDeclaration
 
 RAW_COLUMNS = [
     "open_time_ms",
@@ -52,11 +52,11 @@ def _canonicalize(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return frame[["timestamp", "symbol", "open", "high", "low", "close", "volume", "turnover"]]
 
 
-def _load_crypto_top50(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
+def _load_crypto_top50(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]]:
     frames: list[pd.DataFrame] = []
     paths: list[Path] = []
     for symbol in spec.symbols:
-        path = spec.path / f"{symbol}_1h.csv"
+        path = Path(spec.path) / f"{symbol}_1h.csv"
         if not path.exists():
             raise DataContractError(f"crypto_top50 未找到 {symbol}：{path}")
         raw = pd.read_csv(path)
@@ -66,11 +66,11 @@ def _load_crypto_top50(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
     return pd.concat(frames, ignore_index=True), paths
 
 
-def _load_bybit_parquet(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
+def _load_bybit_parquet(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]]:
     frames: list[pd.DataFrame] = []
     paths: list[Path] = []
     for symbol in spec.symbols:
-        candidates = sorted(spec.path.glob(f"{symbol}_linear_1m/*.parquet"))
+        candidates = sorted(Path(spec.path).glob(f"{symbol}_linear_1m/*.parquet"))
         if not candidates:
             raise DataContractError(f"Bybit 未找到 {symbol} 的 Parquet 文件")
         for path in candidates:
@@ -83,11 +83,11 @@ def _load_bybit_parquet(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
     return pd.concat(frames, ignore_index=True), paths
 
 
-def _load_binance_zip(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
+def _load_binance_zip(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]]:
     frames: list[pd.DataFrame] = []
     paths: list[Path] = []
     for symbol in spec.symbols:
-        candidates = sorted((spec.path / symbol / spec.frequency).glob("*.zip"))
+        candidates = sorted((Path(spec.path) / symbol / spec.frequency).glob("*.zip"))
         if not candidates:
             raise DataContractError(f"Binance 未找到 {symbol}/{spec.frequency} 的压缩 K 线")
         for path in candidates:
@@ -108,7 +108,7 @@ def _load_binance_zip(spec: DataSpec) -> tuple[pd.DataFrame, list[Path]]:
     return pd.concat(frames, ignore_index=True), paths
 
 
-def load_market_data(spec: DataSpec) -> tuple[pd.DataFrame, dict[str, object]]:
+def load_market_data(spec: DataDeclaration) -> tuple[pd.DataFrame, dict[str, object]]:
     """加载、规范化并过滤市场数据。"""
     if spec.adapter == "crypto_top50":
         frame, paths = _load_crypto_top50(spec)

@@ -75,7 +75,9 @@ def test_native_factor_generates_report_and_candidate(tmp_path: Path) -> None:
     assert (result.run_dir / "group_cumulative_returns.csv").exists()
     assert (result.run_dir / "report.html").exists()
     assert json.loads((result.run_dir / "run_spec.json").read_text(encoding="utf-8"))["run_kind"] == "factor"
-    assert list_factors(tmp_path / "library", status="candidate")[0]["source_type"] == "automatic_run"
+    assert list_factors(tmp_path / "library", status="candidate")[0]["source_run"] == str(
+        result.run_dir.resolve()
+    )
 
 
 def test_invalid_native_factor_does_not_create_candidate(tmp_path: Path) -> None:

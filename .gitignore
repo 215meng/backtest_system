@@ -8,6 +8,8 @@ __pycache__/
 results/
 factor_library/artifacts/
 factor_library/*.sqlite
+factor_library_v2/artifacts/
+factor_library_v2/*.sqlite
 data/raw/**
 data/processed/**
 !data/raw/.gitkeep

@@ -7,7 +7,7 @@ import hashlib
 import importlib.util
 import math
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
@@ -34,7 +34,6 @@ from quantbacktest.artifacts import (
     write_json,
 )
 from quantbacktest.library import LibraryError, register_completed_run
-from quantbacktest.schemas import DataSpec
 
 
 class NativeScriptError(ValueError):
@@ -138,18 +137,11 @@ def _initialise(path: Path, kind: Literal["factor", "strategy"]) -> tuple[Module
     return module, context
 
 
-def _data_spec(declaration: DataDeclaration, project_root: Path) -> DataSpec:
+def _resolved_declaration(declaration: DataDeclaration, project_root: Path) -> DataDeclaration:
     source = Path(declaration.path)
-    return DataSpec.model_validate(
-        {
-            "adapter": declaration.adapter,
-            "path": str(source if source.is_absolute() else (project_root / source).resolve()),
-            "market": declaration.market,
-            "frequency": declaration.frequency,
-            "symbols": declaration.symbols,
-            "start": declaration.start,
-            "end": declaration.end,
-        }
+    return replace(
+        declaration,
+        path=str(source if source.is_absolute() else (project_root / source).resolve()),
     )
 
 
@@ -172,7 +164,7 @@ def _load_declared_data(context: ScriptContext, project_root: Path) -> tuple[pd.
     declaration = context.data_declaration
     assert declaration is not None
     try:
-        frame, metadata = load_market_data(_data_spec(declaration, project_root))
+        frame, metadata = load_market_data(_resolved_declaration(declaration, project_root))
     except (DataContractError, ValueError) as exc:
         raise DownloadManifestError(str(exc), _availability_manifest(declaration)) from exc
     start = pd.to_datetime(declaration.start, utc=True) if declaration.start else None

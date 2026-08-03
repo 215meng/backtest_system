@@ -4,7 +4,7 @@ import zipfile
 from pathlib import Path
 
 from quantbacktest.adapters import load_market_data
-from quantbacktest.schemas import DataSpec
+from quantbacktest.api import DataDeclaration
 
 
 def test_binance_zip_ignores_optional_header_row(tmp_path: Path) -> None:
@@ -18,8 +18,12 @@ def test_binance_zip_ignores_optional_header_row(tmp_path: Path) -> None:
     )
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("BTCUSDT-1h-2024-01.csv", content)
-    spec = DataSpec.model_validate(
-        {"adapter": "binance_zip", "path": str(tmp_path), "market": "spot", "frequency": "1h", "symbols": ["BTCUSDT"]}
+    spec = DataDeclaration(
+        adapter="binance_zip",
+        path=str(tmp_path),
+        market="spot",
+        frequency="1h",
+        symbols=["BTCUSDT"],
     )
 
     frame, metadata = load_market_data(spec)
@@ -33,8 +37,12 @@ def test_binance_zip_accepts_microsecond_archive_timestamps(tmp_path: Path) -> N
     directory.mkdir(parents=True)
     with zipfile.ZipFile(directory / "BTCUSDT-1h-2024-01.zip", "w") as output:
         output.writestr("rows.csv", "1704067200000000,100,101,99,100,1,1704070799999999,100,1,1,100,0\n")
-    spec = DataSpec.model_validate(
-        {"adapter": "binance_zip", "path": str(tmp_path), "market": "spot", "frequency": "1h", "symbols": ["BTCUSDT"]}
+    spec = DataDeclaration(
+        adapter="binance_zip",
+        path=str(tmp_path),
+        market="spot",
+        frequency="1h",
+        symbols=["BTCUSDT"],
     )
 
     _, metadata = load_market_data(spec)
