@@ -11,8 +11,7 @@ def initialize(context):
         market="spot",
         frequency="1h",
         symbols=["BTCUSDT", "ETHUSDT"],
-        start="2024-01-01T00:00:00Z",
-        end="2024-01-07T23:00:00Z",
+        warmup_bars=23,
     )
     context.set_account(initial_cash=100_000.0, benchmark="BTCUSDT", fee_bps=5.0, slippage_bps=2.0)
     run_daily(rebalance, when="close")

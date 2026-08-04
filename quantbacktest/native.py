@@ -6,7 +6,10 @@ import ast
 import hashlib
 import importlib.util
 import math
+import platform
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -46,6 +49,11 @@ class DownloadManifestError(NativeScriptError):
     def __init__(self, message: str, manifest: dict[str, Any]) -> None:
         super().__init__(message)
         self.manifest = manifest
+
+
+DEFAULT_BACKTEST_START = "2024-01-01T00:00:00+00:00"
+DEFAULT_BACKTEST_END = "2025-01-01T23:59:59.999999+00:00"
+METRIC_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -145,14 +153,55 @@ def _resolved_declaration(declaration: DataDeclaration, project_root: Path) -> D
     )
 
 
-def _availability_manifest(declaration: DataDeclaration, actual: pd.DataFrame | None = None) -> dict[str, Any]:
+def _end_of_day_bar_start(timestamp: pd.Timestamp, frequency: str) -> pd.Timestamp:
+    """将 Web 的全天结束时刻映射到该频率最后一根 K 线的开盘时刻。"""
+    end_of_day = timestamp.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    if timestamp != end_of_day:
+        return timestamp
+    minutes = {"1m": 1, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}[frequency]
+    return timestamp.normalize() + pd.Timedelta(days=1) - pd.Timedelta(minutes=minutes)
+
+
+def _platform_range(
+    context: ScriptContext,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, str]:
+    """解析平台唯一控制的评价区间，并计算预热行情加载起点。"""
+    declaration = context.data_declaration
+    assert declaration is not None
+    try:
+        parsed_start = pd.to_datetime(start or DEFAULT_BACKTEST_START, utc=True)
+        requested_end = pd.to_datetime(end or DEFAULT_BACKTEST_END, utc=True)
+    except (TypeError, ValueError) as exc:
+        raise NativeScriptError("平台回测区间必须是可解析的 ISO 8601 时间") from exc
+    effective_end = _end_of_day_bar_start(requested_end, declaration.frequency)
+    if parsed_start > effective_end:
+        raise NativeScriptError("平台回测开始时间不能晚于结束时间")
+    bar_delta = pd.Timedelta({"1m": "1min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1d"}[declaration.frequency])
+    load_start = parsed_start - declaration.warmup_bars * bar_delta
+    return {
+        "start": parsed_start.isoformat(),
+        "end": requested_end.isoformat(),
+        "effective_end": effective_end.isoformat(),
+        "load_start": load_start.isoformat(),
+        "load_end": effective_end.isoformat(),
+    }
+
+
+def _availability_manifest(
+    declaration: DataDeclaration,
+    data_range: dict[str, str],
+    actual: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     return {
         "adapter": declaration.adapter,
         "market": declaration.market,
         "frequency": declaration.frequency,
         "symbols": declaration.symbols,
-        "requested_start": declaration.start,
-        "requested_end": declaration.end,
+        "requested_start": data_range["load_start"],
+        "requested_end": data_range["load_end"],
         "required_fields": ["timestamp", "symbol", "open", "high", "low", "close", "volume", "turnover"],
         "available_start": actual["timestamp"].min().isoformat() if actual is not None and not actual.empty else None,
         "available_end": actual["timestamp"].max().isoformat() if actual is not None and not actual.empty else None,
@@ -160,31 +209,51 @@ def _availability_manifest(declaration: DataDeclaration, actual: pd.DataFrame | 
     }
 
 
-def _load_declared_data(context: ScriptContext, project_root: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+def _load_declared_data(
+    context: ScriptContext,
+    project_root: Path,
+    data_range: dict[str, str],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     declaration = context.data_declaration
     assert declaration is not None
     try:
-        frame, metadata = load_market_data(_resolved_declaration(declaration, project_root))
+        frame, metadata = load_market_data(
+            _resolved_declaration(declaration, project_root),
+            start=data_range["load_start"],
+            end=data_range["load_end"],
+        )
     except (DataContractError, ValueError) as exc:
-        raise DownloadManifestError(str(exc), _availability_manifest(declaration)) from exc
-    start = pd.to_datetime(declaration.start, utc=True) if declaration.start else None
-    end = pd.to_datetime(declaration.end, utc=True) if declaration.end else None
-    if (start is not None and frame["timestamp"].min() > start) or (end is not None and frame["timestamp"].max() < end):
-        raise DownloadManifestError("本地数据覆盖区间不足", _availability_manifest(declaration, frame))
+        raise DownloadManifestError(str(exc), _availability_manifest(declaration, data_range)) from exc
     return frame.sort_values(["timestamp", "symbol"]).reset_index(drop=True), metadata
 
 
-def validate_factor_script(path: Path, project_root: Path | None = None, *, check_data: bool = True) -> dict[str, Any]:
+def validate_factor_script(
+    path: Path,
+    project_root: Path | None = None,
+    *,
+    check_data: bool = True,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
     _, context = _initialise(path.resolve(), "factor")
-    payload: dict[str, Any] = {"valid": True, "kind": "factor", "manifest": context.manifest()}
+    data_range = _platform_range(context, start=start, end=end)
+    payload: dict[str, Any] = {"valid": True, "kind": "factor", "manifest": context.manifest(), "platform_backtest_range": data_range}
     if check_data:
-        frame, data = _load_declared_data(context, project_root or path.parent)
+        frame, data = _load_declared_data(context, project_root or path.parent, data_range)
         payload["data"] = {**data, "rows": len(frame)}
     return payload
 
 
-def validate_strategy_script(path: Path, project_root: Path | None = None, *, check_data: bool = True) -> dict[str, Any]:
+def validate_strategy_script(
+    path: Path,
+    project_root: Path | None = None,
+    *,
+    check_data: bool = True,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
     _, context = _initialise(path.resolve(), "strategy")
+    data_range = _platform_range(context, start=start, end=end)
     account = context.account_declaration
     assert account is not None and context.data_declaration is not None
     if context.data_declaration.market == "spot" and account.leverage is not None:
@@ -193,16 +262,16 @@ def validate_strategy_script(path: Path, project_root: Path | None = None, *, ch
         if account.leverage is None or account.margin_mode != "isolated" or account.funding_bps_per_bar is None:
             raise DownloadManifestError(
                 "线性合约必须明确逐仓、杠杆和资金费率，且本地数据还需合约规格",
-                {**_availability_manifest(context.data_declaration), "required_contract_fields": ["funding_rate", "contract_spec"]},
+                {**_availability_manifest(context.data_declaration, data_range), "required_contract_fields": ["funding_rate", "contract_spec"]},
             )
         # 当前适配器仅有 K 线；即使脚本声明费率，也不能伪造合约规格。
         raise DownloadManifestError(
             "当前 Bybit 本地适配器没有合约规格与资金费率时间序列",
-            {**_availability_manifest(context.data_declaration), "required_contract_fields": ["funding_rate", "contract_spec"]},
+            {**_availability_manifest(context.data_declaration, data_range), "required_contract_fields": ["funding_rate", "contract_spec"]},
         )
-    payload: dict[str, Any] = {"valid": True, "kind": "strategy", "manifest": context.manifest()}
+    payload: dict[str, Any] = {"valid": True, "kind": "strategy", "manifest": context.manifest(), "platform_backtest_range": data_range}
     if check_data:
-        frame, data = _load_declared_data(context, project_root or path.parent)
+        frame, data = _load_declared_data(context, project_root or path.parent, data_range)
         payload["data"] = {**data, "rows": len(frame)}
     return payload
 
@@ -280,7 +349,12 @@ def _weight_group(group: pd.DataFrame, weighting: str) -> pd.Series:
     return values / values.sum() if values.sum() > 0 else pd.Series(1.0 / len(group), index=group.index)
 
 
-def _factor_evaluation(panel: pd.DataFrame, evaluation: FactorEvaluation, frequency: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+def _factor_evaluation(
+    panel: pd.DataFrame,
+    evaluation: FactorEvaluation,
+    frequency: str,
+    opportunity_count: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     valid = panel.dropna(subset=["factor", "forward_return"]).copy()
     if valid.empty:
         raise NativeScriptError("没有同时具有有效因子与前瞻收益的观测")
@@ -326,52 +400,154 @@ def _factor_evaluation(panel: pd.DataFrame, evaluation: FactorEvaluation, freque
     returns = returns.set_index("timestamp").sort_index()
     ic = valid.groupby("timestamp").apply(lambda group: group["factor"].corr(group["forward_return"]), include_groups=False)
     rank_ic = valid.groupby("timestamp").apply(lambda group: group["factor"].corr(group["forward_return"], method="spearman"), include_groups=False)
-    annual_frequency = {"bar": frequency, "daily": "1d", "weekly": "1d"}.get("bar", frequency)
-    # 周频持有期的年化以 52 个形成期计算，日频以 365，bar 频沿用原频率。
-    annual = 52 if len(returns) > 1 and evaluation.horizon_bars > 1 and len(returns) < 200 else {"1m": 525600, "15m": 35040, "1h": 8760, "4h": 2190, "1d": 365}[annual_frequency]
+    annual = {
+        "weekly": 52,
+        "daily": 365,
+        "bar": {"1m": 525600, "15m": 35040, "1h": 8760, "4h": 2190, "1d": 365}[frequency],
+    }[evaluation.formation]
     def stats(series: pd.Series) -> dict[str, float | None]:
         series = series.dropna()
         if series.empty:
             return {"total_return": None, "annual_return": None, "annual_volatility": None, "sharpe": None, "max_drawdown": None}
-        equity = (1 + series).cumprod()
+        equity = pd.concat([pd.Series([1.0]), (1 + series).cumprod().reset_index(drop=True)], ignore_index=True)
         drawdown = equity / equity.cummax() - 1
         vol = float(series.std(ddof=1) * math.sqrt(annual)) if len(series) > 1 else 0.0
         sharpe = float(series.mean() / series.std(ddof=1) * math.sqrt(annual)) if len(series) > 1 and series.std(ddof=1) else None
         return {"total_return": float(equity.iloc[-1] - 1), "annual_return": float(equity.iloc[-1] ** (annual / len(series)) - 1), "annual_volatility": vol, "sharpe": sharpe, "max_drawdown": float(drawdown.min())}
-    metrics = {
+    gross_stats = stats(returns["gross_return"])
+    net_stats = stats(returns["net_return"])
+    metrics: dict[str, Any] = {
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
         "evaluation_mode": "native_factor",
-        "factor_coverage": float(panel["factor"].notna().mean()),
+        "annualization_periods": annual,
+        "factor_output_coverage": float(panel["factor"].notna().sum() / opportunity_count) if opportunity_count else 0.0,
+        "evaluable_coverage": float(len(valid) / opportunity_count) if opportunity_count else 0.0,
+        "factor_coverage": float(len(valid) / opportunity_count) if opportunity_count else 0.0,
         "formation_periods": len(returns),
         "ic_mean": float(ic.mean()) if not ic.dropna().empty else None,
         "rank_ic_mean": float(rank_ic.mean()) if not rank_ic.dropna().empty else None,
-        "icir": float(rank_ic.mean() / rank_ic.std(ddof=1)) if len(rank_ic.dropna()) > 1 and rank_ic.std(ddof=1) else None,
+        "icir": float(ic.mean() / ic.std(ddof=1)) if len(ic.dropna()) > 1 and ic.std(ddof=1) else None,
+        "rank_icir": float(rank_ic.mean() / rank_ic.std(ddof=1)) if len(rank_ic.dropna()) > 1 and rank_ic.std(ddof=1) else None,
         "monotonicity": float(np.corrcoef(np.arange(1, evaluation.groups + 1), groups.groupby("group")["return"].mean().reindex(range(1, evaluation.groups + 1)))[0, 1]) if evaluation.groups > 1 else None,
         "mean_turnover": float(returns["turnover"].mean()),
-        "cost_before": stats(returns["gross_return"]),
-        "cost_after": stats(returns["net_return"]),
+        # 顶层字段是候选审核、因子库和外部消费者的稳定展示契约；
+        # 嵌套字段保留，确保既有运行工件仍可读取。
+        **{f"long_short_{key}": value for key, value in net_stats.items()},
+        **{f"long_short_cost_before_{key}": value for key, value in gross_stats.items()},
+        **{f"long_short_cost_after_{key}": value for key, value in net_stats.items()},
+        "cost_before": gross_stats,
+        "cost_after": net_stats,
     }
+    for key in ("ic_mean", "rank_ic_mean", "icir", "rank_icir", "monotonicity"):
+        value = metrics.get(key)
+        metrics[f"directional_{key}"] = value * direction if isinstance(value, (int, float)) else value
     return groups, cumulative, returns.reset_index(), metrics
 
 
-def _single_asset_diagnostics(panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+def _single_asset_diagnostics(panel: pd.DataFrame, opportunity_count: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     valid = panel.dropna(subset=["factor", "forward_return"]).sort_values("timestamp")
     correlation = valid["factor"].corr(valid["forward_return"])
     rank = valid["factor"].corr(valid["forward_return"], method="spearman")
     valid["quantile"] = pd.qcut(valid["factor"].rank(method="first"), q=min(5, len(valid)), labels=False, duplicates="drop")
     quantiles = valid.groupby("quantile", as_index=False)["forward_return"].mean().rename(columns={"forward_return": "return"})
-    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {"evaluation_mode": "native_factor_single_asset", "cross_sectional_ic": "不适用", "group_returns": "不适用", "time_series_ic": float(correlation) if pd.notna(correlation) else None, "time_series_rank_ic": float(rank) if pd.notna(rank) else None, "factor_coverage": float(panel["factor"].notna().mean()), "quantile_returns": quantiles.to_dict("records")}
+    coverage = float(len(valid) / opportunity_count) if opportunity_count else 0.0
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {"metric_schema_version": METRIC_SCHEMA_VERSION, "evaluation_mode": "native_factor_single_asset", "cross_sectional_ic": "不适用", "group_returns": "不适用", "time_series_ic": float(correlation) if pd.notna(correlation) else None, "time_series_rank_ic": float(rank) if pd.notna(rank) else None, "factor_output_coverage": float(panel["factor"].notna().sum() / opportunity_count) if opportunity_count else 0.0, "evaluable_coverage": coverage, "factor_coverage": coverage, "quantile_returns": quantiles.to_dict("records")}
 
 
-def run_factor_script(path: Path, project_root: Path | None = None, candidate_library_root: Path | None = None) -> NativeRunResult:
+def _runtime_fingerprint(root: Path, script: Path) -> dict[str, Any]:
+    def command(*args: str) -> str | None:
+        try:
+            return subprocess.run(args, cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    tracked = [
+        "quantbacktest/api.py", "quantbacktest/native.py", "quantbacktest/adapters/market.py",
+        "quantbacktest/library.py", "quantbacktest/web.py", "quantbacktest/artifacts.py",
+    ]
+    hashes = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in tracked if (root / name).is_file()
+    }
+    return {
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
+        "python": platform.python_version(),
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+        "streamlit": __import__("streamlit").__version__,
+        "git_commit": command("git", "rev-parse", "HEAD"),
+        "workspace_dirty": bool(command("git", "status", "--porcelain")),
+        "platform_file_hashes": hashes,
+        "factor_script_hash": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "executable": sys.executable,
+    }
+
+
+def _universe_diagnostics(
+    formations: pd.DatetimeIndex,
+    factor: pd.DataFrame,
+    panel: pd.DataFrame,
+    symbols: list[str],
+    rejections: dict[tuple[str, str], str],
+    data_metadata: dict[str, Any],
+    groups: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for timestamp in formations:
+        key = timestamp.isoformat()
+        output_symbols = set(factor.loc[(factor["timestamp"] == timestamp) & factor["factor"].notna(), "symbol"])
+        evaluable_symbols = set(panel.loc[(panel["timestamp"] == timestamp) & panel["factor"].notna() & panel["forward_return"].notna(), "symbol"])
+        missing = [symbol for symbol in symbols if symbol not in output_symbols]
+        symbol_diagnostics = data_metadata.get("symbol_diagnostics", {})
+        rows.append({
+            "timestamp": timestamp,
+            "declared_assets": len(symbols),
+            "factor_output_assets": len(output_symbols),
+            "evaluable_assets": len(evaluable_symbols),
+            "missing_asset_count": len(missing),
+            "missing_assets": "|".join(missing),
+            "missing_reasons": "|".join(f"{symbol}:{rejections.get((key, symbol), '无有效因子')}" for symbol in missing),
+            "missing_bar_counts": "|".join(
+                f"{symbol}:{symbol_diagnostics.get(symbol, {}).get('missing_bars')}" for symbol in missing
+            ),
+            "last_market_times": "|".join(
+                f"{symbol}:{symbol_diagnostics.get(symbol, {}).get('last_market_time')}" for symbol in missing
+            ),
+            "period_status": "evaluated" if len(evaluable_symbols) >= groups else "skipped",
+            "skip_reason": "" if len(evaluable_symbols) >= groups else "有效标的少于分组数",
+        })
+    return pd.DataFrame(rows)
+
+
+def run_factor_script(
+    path: Path,
+    project_root: Path | None = None,
+    candidate_library_root: Path | None = None,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> NativeRunResult:
     path = path.resolve()
     root = (project_root or path.parent).resolve()
     module, context = _initialise(path, "factor")
-    data, data_meta = _load_declared_data(context, root)
+    script_data_declaration = context.manifest()["data"]
+    data_range = _platform_range(context, start=start, end=end)
+    data, data_meta = _load_declared_data(context, root, data_range)
     evaluation = context.factor_evaluation
     assert evaluation is not None and context.data_declaration is not None
     main = module.main
     outputs: list[pd.DataFrame] = []
-    for timestamp in _formations(data, evaluation.formation):
+    evaluation_start = pd.to_datetime(data_range["start"], utc=True)
+    evaluation_end = pd.to_datetime(data_range["effective_end"], utc=True)
+    formation_times = _formations(data, evaluation.formation)
+    formation_times = formation_times[(formation_times >= evaluation_start) & (formation_times <= evaluation_end)]
+    all_times = pd.DatetimeIndex(data["timestamp"].drop_duplicates().sort_values())
+    positions = {timestamp: index for index, timestamp in enumerate(all_times)}
+    evaluable_formations = pd.DatetimeIndex([
+        timestamp for timestamp in formation_times
+        if positions[timestamp] + evaluation.horizon_bars < len(all_times)
+    ])
+    for timestamp in formation_times:
         context.now, context.event = timestamp, "close"
         context._visible_data = data[data["timestamp"] <= timestamp].copy()
         try:
@@ -383,22 +559,74 @@ def run_factor_script(path: Path, project_root: Path | None = None, candidate_li
     if factor.empty or factor["factor"].notna().sum() == 0:
         raise NativeScriptError("整个样本期的因子输出为空或全为空值")
     panel = _entry_exit(data, factor, evaluation)
-    is_single = data["symbol"].nunique() == 1
+    opportunity_count = len(evaluable_formations) * len(context.data_declaration.symbols)
+    is_single = len(context.data_declaration.symbols) == 1
     if is_single:
-        groups, curves, long_short, metrics = _single_asset_diagnostics(panel)
+        groups, curves, long_short, metrics = _single_asset_diagnostics(panel, opportunity_count)
     else:
-        groups, curves, long_short, metrics = _factor_evaluation(panel, evaluation, context.data_declaration.frequency)
+        groups, curves, long_short, metrics = _factor_evaluation(panel, evaluation, context.data_declaration.frequency, opportunity_count)
+    valid_panel = panel.dropna(subset=["factor", "forward_return"])
+    if not is_single:
+        used_times = pd.to_datetime(long_short["timestamp"], utc=True)
+        valid_panel = valid_panel[valid_panel["timestamp"].isin(used_times)]
+    actual_evaluation_range = {
+        "start": valid_panel["timestamp"].min().isoformat(),
+        "end": valid_panel["return_end_time"].max().isoformat(),
+    }
+    universe = _universe_diagnostics(
+        evaluable_formations,
+        factor,
+        panel,
+        context.data_declaration.symbols,
+        context._history_rejections,
+        data_meta,
+        evaluation.groups,
+    )
+    warnings: list[str] = []
+    if len(context.data_declaration.symbols) < 10:
+        warnings.append("研究样本过小：截面资产少于 10 个，IC 与分组结果可能高度离散。")
+    if evaluation.fee_bps == 0 and evaluation.slippage_bps == 0:
+        warnings.append("交易成本未启用：成本前后结果相同。")
+    metrics.update({
+        "platform_backtest_start": data_range["start"],
+        "platform_backtest_end": data_range["end"],
+        "market_data_start": data_meta["start"],
+        "market_data_end": data_meta["end"],
+        "actual_evaluation_start": actual_evaluation_range["start"],
+        "actual_evaluation_end": actual_evaluation_range["end"],
+        "warnings": warnings,
+    })
     output_root = root / "results" / "backtests"
     run_dir = create_run_dir(output_root, context.name or path.stem)
     shutil.copy2(path, run_dir / "factor_snapshot.py")
-    manifest = {"run_kind": "factor", **context.manifest(), "script_path": str(path), "data": data_meta}
+    manifest = {
+        "run_kind": "factor",
+        **context.manifest(),
+        "script_path": str(path),
+        "script_data_declaration": script_data_declaration,
+        "platform_backtest_range": data_range,
+        "runtime_fingerprint": _runtime_fingerprint(root, path),
+        "data": data_meta,
+    }
     write_json(run_dir / "run_spec.json", manifest)
-    write_json(run_dir / "metadata.json", {"run_kind": "factor", "data": data_meta, "actual_data_range": {"start": data_meta["start"], "end": data_meta["end"]}})
+    write_json(
+        run_dir / "metadata.json",
+        {
+            "run_kind": "factor",
+            "data": data_meta,
+            "script_data_declaration": script_data_declaration,
+            "platform_backtest_range": data_range,
+            "market_data_range": {"start": data_meta["start"], "end": data_meta["end"]},
+            "actual_evaluation_range": actual_evaluation_range,
+            "runtime_fingerprint": manifest["runtime_fingerprint"],
+        },
+    )
     factor.to_csv(run_dir / "factor_values.csv", index=False)
     panel.to_csv(run_dir / "factor_panel.csv", index=False)
     groups.to_csv(run_dir / "group_returns.csv", index=False)
     curves.to_csv(run_dir / "group_cumulative_returns.csv")
     long_short.to_csv(run_dir / "long_short_returns.csv", index=False)
+    universe.to_csv(run_dir / "universe_diagnostics.csv", index=False)
     write_json(run_dir / "metrics.json", metrics)
     render_native_factor_report(run_dir / "report.html", groups, curves, long_short, metrics, manifest)
     candidate: dict[str, str] | None = None
@@ -407,7 +635,7 @@ def run_factor_script(path: Path, project_root: Path | None = None, candidate_li
         candidate = register_completed_run(run_dir, candidate_library_root)
     except (LibraryError, OSError, ValueError) as exc:
         registration_error = str(exc)
-    return NativeRunResult(run_dir, metrics, [], "factor", candidate, registration_error)
+    return NativeRunResult(run_dir, metrics, warnings, "factor", candidate, registration_error)
 
 
 def _strategy_visible_data(frame: pd.DataFrame, timestamp: pd.Timestamp, event: str) -> pd.DataFrame:
@@ -433,12 +661,20 @@ def _is_due(schedule: Any, timestamp: pd.Timestamp, bar_number: int, seen_days: 
     return True
 
 
-def run_strategy_script(path: Path, project_root: Path | None = None) -> NativeRunResult:
+def run_strategy_script(
+    path: Path,
+    project_root: Path | None = None,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> NativeRunResult:
     path = path.resolve()
     root = (project_root or path.parent).resolve()
     _, context = _initialise(path, "strategy")
-    validate_strategy_script(path, root, check_data=False)
-    data, data_meta = _load_declared_data(context, root)
+    script_data_declaration = context.manifest()["data"]
+    data_range = _platform_range(context, start=start, end=end)
+    validate_strategy_script(path, root, check_data=False, start=start, end=end)
+    data, data_meta = _load_declared_data(context, root, data_range)
     declaration, account = context.data_declaration, context.account_declaration
     assert declaration is not None and account is not None
     prices = data.set_index(["timestamp", "symbol"])[["open", "close"]]
@@ -504,6 +740,10 @@ def run_strategy_script(path: Path, project_root: Path | None = None) -> NativeR
         return record(order)
 
     timestamps = pd.DatetimeIndex(data["timestamp"].drop_duplicates().sort_values())
+    timestamps = timestamps[
+        (timestamps >= pd.to_datetime(data_range["start"], utc=True))
+        & (timestamps <= pd.to_datetime(data_range["effective_end"], utc=True))
+    ]
     daily_seen: dict[int, set[tuple[str, str]]] = {index: set() for index in range(len(context.schedules))}
     for bar_number, timestamp in enumerate(timestamps):
         for event in ("open", "close"):
@@ -534,9 +774,28 @@ def run_strategy_script(path: Path, project_root: Path | None = None) -> NativeR
     output_root = root / "results" / "backtests"
     run_dir = create_run_dir(output_root, context.name or path.stem)
     shutil.copy2(path, run_dir / "strategy_snapshot.py")
-    manifest = {"run_kind": "strategy", **context.manifest(), "script_path": str(path), "data": data_meta}
+    manifest = {
+        "run_kind": "strategy",
+        **context.manifest(),
+        "script_path": str(path),
+        "script_data_declaration": script_data_declaration,
+        "platform_backtest_range": data_range,
+        "runtime_fingerprint": _runtime_fingerprint(root, path),
+        "data": data_meta,
+    }
     write_json(run_dir / "run_spec.json", manifest)
-    write_json(run_dir / "metadata.json", {"run_kind": "strategy", "data": data_meta, "actual_data_range": {"start": data_meta["start"], "end": data_meta["end"]}})
+    write_json(
+        run_dir / "metadata.json",
+        {
+            "run_kind": "strategy",
+            "data": data_meta,
+            "script_data_declaration": script_data_declaration,
+            "platform_backtest_range": data_range,
+            "market_data_range": {"start": data_meta["start"], "end": data_meta["end"]},
+            "actual_evaluation_range": {"start": timestamps.min().isoformat(), "end": timestamps.max().isoformat()},
+            "runtime_fingerprint": manifest["runtime_fingerprint"],
+        },
+    )
     returns.to_csv(run_dir / "returns.csv", header=True)
     pd.DataFrame(order_rows, columns=["timestamp", "event", "symbol", "requested_value", "status", "reason", "quantity", "price", "fee"]).to_csv(run_dir / "orders.csv", index=False)
     pd.DataFrame([{"timestamp": timestamp, "symbol": symbol, "quantity": position.quantity, "market_value": position.market_value} for timestamp in [timestamps[-1]] for symbol, position in context.portfolio.positions.items()]).to_csv(run_dir / "positions.csv", index=False)

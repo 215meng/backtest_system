@@ -58,11 +58,13 @@ def _load_crypto_top50(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]]
     for symbol in spec.symbols:
         path = Path(spec.path) / f"{symbol}_1h.csv"
         if not path.exists():
-            raise DataContractError(f"crypto_top50 未找到 {symbol}：{path}")
+            continue
         raw = pd.read_csv(path)
         raw = raw.rename(columns={"volume_from": "volume", "volume_to": "turnover"})
         frames.append(_canonicalize(raw, symbol))
         paths.append(path)
+    if not frames:
+        raise DataContractError("crypto_top50 未找到任何已声明标的的数据")
     return pd.concat(frames, ignore_index=True), paths
 
 
@@ -72,7 +74,7 @@ def _load_bybit_parquet(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]
     for symbol in spec.symbols:
         candidates = sorted(Path(spec.path).glob(f"{symbol}_linear_1m/*.parquet"))
         if not candidates:
-            raise DataContractError(f"Bybit 未找到 {symbol} 的 Parquet 文件")
+            continue
         for path in candidates:
             raw = pd.read_parquet(path)
             if "timestamp" not in raw and "timestamp_ms" in raw:
@@ -80,6 +82,8 @@ def _load_bybit_parquet(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]
             raw = raw.rename(columns={"turnover": "turnover"})
             frames.append(_canonicalize(raw, symbol))
             paths.append(path)
+    if not frames:
+        raise DataContractError("Bybit 未找到任何已声明标的的数据")
     return pd.concat(frames, ignore_index=True), paths
 
 
@@ -89,7 +93,7 @@ def _load_binance_zip(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]]:
     for symbol in spec.symbols:
         candidates = sorted((Path(spec.path) / symbol / spec.frequency).glob("*.zip"))
         if not candidates:
-            raise DataContractError(f"Binance 未找到 {symbol}/{spec.frequency} 的压缩 K 线")
+            continue
         for path in candidates:
             with zipfile.ZipFile(path) as archive:
                 member = archive.namelist()[0]
@@ -105,10 +109,31 @@ def _load_binance_zip(spec: DataDeclaration) -> tuple[pd.DataFrame, list[Path]]:
             raw["timestamp"] = pd.to_datetime(raw["open_time_ms"], unit=unit, utc=True)
             frames.append(_canonicalize(raw, symbol))
             paths.append(path)
+    if not frames:
+        raise DataContractError("Binance 未找到任何已声明标的的数据")
     return pd.concat(frames, ignore_index=True), paths
 
 
-def load_market_data(spec: DataDeclaration) -> tuple[pd.DataFrame, dict[str, object]]:
+def _frequency_delta(frequency: str) -> pd.Timedelta:
+    mapping = {
+        "1m": pd.Timedelta(minutes=1),
+        "15m": pd.Timedelta(minutes=15),
+        "1h": pd.Timedelta(hours=1),
+        "4h": pd.Timedelta(hours=4),
+        "1d": pd.Timedelta(days=1),
+    }
+    try:
+        return mapping[frequency]
+    except KeyError as exc:
+        raise DataContractError(f"不支持的数据频率：{frequency}") from exc
+
+
+def load_market_data(
+    spec: DataDeclaration,
+    *,
+    start: str | pd.Timestamp | None = None,
+    end: str | pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
     """加载、规范化并过滤市场数据。"""
     if spec.adapter == "crypto_top50":
         frame, paths = _load_crypto_top50(spec)
@@ -119,12 +144,32 @@ def load_market_data(spec: DataDeclaration) -> tuple[pd.DataFrame, dict[str, obj
 
     frame = frame.dropna(subset=["timestamp", "open", "close"])
     frame = frame.sort_values(["timestamp", "symbol"]).drop_duplicates(["timestamp", "symbol"])
-    if spec.start:
-        frame = frame[frame["timestamp"] >= pd.to_datetime(spec.start, utc=True)]
-    if spec.end:
-        frame = frame[frame["timestamp"] <= pd.to_datetime(spec.end, utc=True)]
+    requested_start = pd.to_datetime(start, utc=True) if start is not None else None
+    requested_end = pd.to_datetime(end, utc=True) if end is not None else None
+    if requested_start is not None:
+        frame = frame[frame["timestamp"] >= requested_start]
+    if requested_end is not None:
+        frame = frame[frame["timestamp"] <= requested_end]
     if frame.empty:
         raise DataContractError("日期过滤后没有可用于回测的数据")
+    interval = _frequency_delta(spec.frequency)
+    diagnostics: dict[str, dict[str, object]] = {}
+    for symbol in spec.symbols:
+        symbol_frame = frame[frame["symbol"] == symbol]
+        actual_start = symbol_frame["timestamp"].min() if not symbol_frame.empty else None
+        actual_end = symbol_frame["timestamp"].max() if not symbol_frame.empty else None
+        range_start = requested_start if requested_start is not None else actual_start
+        range_end = requested_end if requested_end is not None else actual_end
+        expected_rows = 0
+        if range_start is not None and range_end is not None and range_end >= range_start:
+            expected_rows = int((range_end - range_start) // interval) + 1
+        diagnostics[symbol] = {
+            "rows": len(symbol_frame),
+            "expected_rows": expected_rows,
+            "missing_bars": max(expected_rows - len(symbol_frame), 0),
+            "start": actual_start.isoformat() if actual_start is not None else None,
+            "last_market_time": actual_end.isoformat() if actual_end is not None else None,
+        }
     metadata = {
         "adapter": spec.adapter,
         "source_paths": [str(path) for path in paths],
@@ -133,6 +178,9 @@ def load_market_data(spec: DataDeclaration) -> tuple[pd.DataFrame, dict[str, obj
         "symbols": sorted(frame["symbol"].unique().tolist()),
         "start": frame["timestamp"].min().isoformat(),
         "end": frame["timestamp"].max().isoformat(),
+        "declared_symbols": list(spec.symbols),
+        "missing_symbols": sorted(set(spec.symbols) - set(frame["symbol"].unique())),
+        "symbol_diagnostics": diagnostics,
     }
     return frame.reset_index(drop=True), metadata
 

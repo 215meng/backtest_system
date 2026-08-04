@@ -61,8 +61,7 @@ def initialize(context):
         market="spot",
         frequency="1h",
         symbols=["BTCUSDT", "ETHUSDT"],
-        start="2024-01-01T00:00:00Z",
-        end="2024-12-31T23:00:00Z",
+        warmup_bars=24,
     )
     context.set_factor_evaluation(
         formation="daily", horizon_bars=24,
@@ -96,8 +95,7 @@ def initialize(context):
         market="spot",
         frequency="1h",
         symbols=["BTCUSDT", "ETHUSDT"],
-        start="2024-01-01T00:00:00Z",
-        end="2024-12-31T23:00:00Z",
+        warmup_bars=20,
     )
     context.set_account(
         initial_cash=100_000.0,

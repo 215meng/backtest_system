@@ -27,8 +27,7 @@ class DataDeclaration:
     market: Literal["spot", "linear_perp"]
     frequency: Literal["1m", "15m", "1h", "4h", "1d"]
     symbols: list[str]
-    start: str | None = None
-    end: str | None = None
+    warmup_bars: int = 0
 
 
 @dataclass
@@ -111,6 +110,7 @@ class ScriptContext:
         self.now: pd.Timestamp | None = None
         self.event: Literal["open", "close"] = "close"
         self._visible_data = pd.DataFrame()
+        self._history_rejections: dict[tuple[str, str], str] = {}
         self._orders: list[Order] = []
         self.portfolio = Portfolio(cash=0.0)
         self._order_handler: Callable[[str, float, str], Order] | None = None
@@ -133,12 +133,21 @@ class ScriptContext:
         market: Literal["spot", "linear_perp"],
         frequency: Literal["1m", "15m", "1h", "4h", "1d"],
         symbols: list[str],
-        start: str | None = None,
-        end: str | None = None,
+        warmup_bars: int = 0,
+        **unsupported: Any,
     ) -> None:
+        legacy_dates = sorted(set(unsupported) & {"start", "end"})
+        if legacy_dates:
+            raise ScriptContractError(
+                "set_data 不再接受 start/end；回测区间由平台统一设置，请删除脚本中的日期参数"
+            )
+        if unsupported:
+            raise ScriptContractError(f"set_data 收到不支持的参数：{sorted(unsupported)}")
         if not isinstance(symbols, list) or not symbols or not all(isinstance(item, str) and item for item in symbols):
             raise ScriptContractError("set_data(..., symbols=...) 必须提供非空交易对列表")
-        self.data_declaration = DataDeclaration(adapter, path, market, frequency, symbols, start, end)
+        if not isinstance(warmup_bars, int) or isinstance(warmup_bars, bool) or warmup_bars < 0:
+            raise ScriptContractError("set_data(..., warmup_bars=...) 必须是非负整数")
+        self.data_declaration = DataDeclaration(adapter, path, market, frequency, symbols, warmup_bars)
 
     def set_factor_evaluation(
         self,
@@ -210,11 +219,29 @@ class ScriptContext:
     def history(self, symbol: str, bars: int, fields: list[str] | None = None) -> pd.DataFrame:
         if bars < 1:
             raise ScriptContractError("history 的 bars 必须不小于 1")
+        declaration = self.data_declaration
+        if declaration is None:
+            raise ScriptContractError("history 只能在 set_data 后调用")
+        if bars - 1 > declaration.warmup_bars:
+            raise ScriptContractError(
+                f"history 请求 {bars} 根数据，但脚本只声明 warmup_bars={declaration.warmup_bars}"
+            )
         result = self._visible_data[self._visible_data["symbol"] == symbol].sort_values("timestamp").tail(bars)
         columns = ["timestamp", "symbol", *(fields or ["open", "high", "low", "close", "volume", "turnover"])]
         unknown = set(columns) - set(result.columns)
         if unknown:
             raise ScriptContractError(f"history 请求了不可用字段：{sorted(unknown)}")
+        if self.now is not None:
+            reason: str | None = None
+            if result.empty or pd.Timestamp(result["timestamp"].iloc[-1]) != self.now:
+                reason = "当前形成时点没有最新 K 线"
+            elif len(result) == bars and bars > 1:
+                interval = pd.Timedelta({"1m": "1min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1d"}[declaration.frequency])
+                if not result["timestamp"].diff().dropna().eq(interval).all():
+                    reason = "历史窗口存在缺失 K 线"
+            if reason is not None:
+                self._history_rejections[(self.now.isoformat(), symbol)] = reason
+                return result.iloc[0:0][columns].copy().reset_index(drop=True)
         return result[columns].copy().reset_index(drop=True)
 
     def get_bars(self, symbol: str, bars: int, fields: list[str] | None = None) -> pd.DataFrame:
