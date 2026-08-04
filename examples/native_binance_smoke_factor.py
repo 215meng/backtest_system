@@ -13,7 +13,8 @@ def initialize(context):
         market="spot",
         frequency="1h",
         symbols=["BTCUSDT", "ETHUSDT"],
-        warmup_bars=24,
+        start="2026-07-01T00:00:00Z",
+        end="2026-07-29T23:00:00Z",
     )
     context.set_factor_evaluation(
         formation="daily",

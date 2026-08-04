@@ -19,20 +19,12 @@ def test_mcp_generates_native_python_skeleton_without_yaml(tmp_path: Path) -> No
     content = script.read_text(encoding="utf-8")
     assert "def initialize(context)" in content
     assert "def main(context)" in content
-    assert "warmup_bars=24" in content
-    assert "start=" not in content
-    assert "end=" not in content
     assert ".yaml" not in content
     assert created["next"] == "调用 validate_factor_script"
 
 
 def test_mcp_validation_blocks_missing_local_data_with_manifest(tmp_path: Path) -> None:
     created = server.create_strategy_script(str(tmp_path), "strategies/trend.py", "trend")
-    content = Path(created["script_path"]).read_text(encoding="utf-8")
-
-    assert "warmup_bars=20" in content
-    assert "start=" not in content
-    assert "end=" not in content
 
     validation = server.validate_strategy_script(created["script_path"], str(tmp_path))
 

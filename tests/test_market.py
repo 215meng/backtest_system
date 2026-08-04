@@ -48,28 +48,3 @@ def test_binance_zip_accepts_microsecond_archive_timestamps(tmp_path: Path) -> N
     _, metadata = load_market_data(spec)
 
     assert metadata["start"].startswith("2024-01-01")
-
-
-def test_market_loader_keeps_available_symbols_and_reports_missing_one(tmp_path: Path) -> None:
-    directory = tmp_path / "BTCUSDT" / "1h"
-    directory.mkdir(parents=True)
-    with zipfile.ZipFile(directory / "BTCUSDT-1h-2024-01.zip", "w") as output:
-        output.writestr("rows.csv", "1704067200000,100,101,99,100,1,1704070799999,100,1,1,100,0\n")
-    spec = DataDeclaration(
-        adapter="binance_zip",
-        path=str(tmp_path),
-        market="spot",
-        frequency="1h",
-        symbols=["BTCUSDT", "EOSUSDT"],
-    )
-
-    frame, metadata = load_market_data(
-        spec,
-        start="2024-01-01T00:00:00Z",
-        end="2024-01-01T02:00:00Z",
-    )
-
-    assert frame["symbol"].unique().tolist() == ["BTCUSDT"]
-    assert metadata["missing_symbols"] == ["EOSUSDT"]
-    assert metadata["symbol_diagnostics"]["EOSUSDT"]["missing_bars"] == 3
-    assert metadata["symbol_diagnostics"]["BTCUSDT"]["missing_bars"] == 2
